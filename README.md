@@ -7,7 +7,7 @@ Run a Claude Code conversation on Codex using your existing Codex subscription.
 Add the marketplace from inside Claude Code:
 
 ```text
-/plugin marketplace add <github-owner/repository-or-local-path>
+/plugin marketplace add Prasanna721/cc-codex
 ```
 
 Install the plugin and reload:

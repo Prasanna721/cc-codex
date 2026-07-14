@@ -30,6 +30,7 @@ import {
   renderClaudeCodexSettings,
   resolveSelectedModel,
   syncLocalCodexAuth,
+  withServiceCoordination,
 } from "./core.mjs";
 import {
   fastModelIds,
@@ -227,7 +228,14 @@ export function pendingRouteNotice(config, {
   return null;
 }
 
-export async function prepareTerminalSessionMode(config, {
+export async function prepareTerminalSessionMode(config, options = {}) {
+  return withServiceCoordination(
+    config,
+    () => prepareTerminalSessionModeCoordinated(config, options),
+  );
+}
+
+async function prepareTerminalSessionModeCoordinated(config, {
   sessionId,
   cwd,
   permissionMode = null,

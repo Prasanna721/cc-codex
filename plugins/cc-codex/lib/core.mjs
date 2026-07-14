@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   closeSync,
   createReadStream,
@@ -25,7 +26,7 @@ import {
 import { traceModeEnabled } from "./trace.mjs";
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-export const CONTROLLER_VERSION = "0.9.1";
+export const CONTROLLER_VERSION = "0.9.2";
 
 export const CLIPROXY_PIN = Object.freeze({
   version: "7.2.71",
@@ -54,6 +55,8 @@ export const CLIPROXY_PIN = Object.freeze({
 
 export const CLAUDE_MODEL_PREFIX = "claude-fable-5-dd-";
 export const GATEWAY_MODEL_PREFIX = "claude-codex-";
+
+const serviceCoordinationContext = new AsyncLocalStorage();
 
 export const CLAUDE_PROVIDER_ENV_KEYS = Object.freeze([
   "ANTHROPIC_API_KEY",
@@ -147,6 +150,10 @@ export function getConfig(overrides = {}) {
     overrides.tracePath ?? process.env.CLAUDE_CODEX_TRACE_PATH ??
       join(logsDir, "request-trace.jsonl"),
   );
+  const hostLocksDir = resolve(
+    overrides.hostLocksDir ?? process.env.CLAUDE_CODEX_HOST_LOCKS_DIR ??
+      join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "cc-codex", "locks"),
+  );
 
   return {
     root: ROOT,
@@ -165,6 +172,7 @@ export function getConfig(overrides = {}) {
     localProxyAuthPath: join(stateDir, "cliproxy-auth", "codex-local.json"),
     logsDir,
     locksDir: join(stateDir, "locks"),
+    hostLocksDir,
     sessionsDir: join(stateDir, "sessions"),
     terminalRoutesDir: join(stateDir, "terminal-routes"),
     sessionModesDir: join(stateDir, "session-modes"),
@@ -651,12 +659,27 @@ function managedPid(path, signature) {
 }
 
 async function withLock(config, name, action, timeoutMs = 20_000) {
-  const path = join(config.locksDir, `${name}.lock`);
+  return withDirectoryLock(config.locksDir, name, action, {
+    timeoutMs,
+    owner: { stateDir: config.stateDir },
+  });
+}
+
+async function withDirectoryLock(lockDir, name, action, {
+  timeoutMs = 20_000,
+  owner = {},
+} = {}) {
+  mkdirSync(lockDir, { recursive: true, mode: 0o700 });
+  const path = join(lockDir, `${name}.lock`);
   const started = Date.now();
   for (;;) {
     try {
       mkdirSync(path, { mode: 0o700 });
-      writeFileSync(join(path, "owner.json"), JSON.stringify({ pid: process.pid, at: Date.now() }));
+      writeFileSync(
+        join(path, "owner.json"),
+        JSON.stringify({ pid: process.pid, at: Date.now(), version: CONTROLLER_VERSION, ...owner }),
+        { mode: 0o600 },
+      );
       break;
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
@@ -689,6 +712,27 @@ async function withLock(config, name, action, timeoutMs = 20_000) {
   } finally {
     rmSync(path, { recursive: true, force: true });
   }
+}
+
+export async function withServiceCoordination(config = getConfig(), action) {
+  if (typeof action !== "function") throw new TypeError("CC Codex coordination requires an action");
+  const name = `services-${config.gatewayPort}-${config.proxyPort}-${config.appServerPort}`;
+  const lockPath = join(config.hostLocksDir, `${name}.lock`);
+  if (serviceCoordinationContext.getStore() === lockPath) return action();
+  return withDirectoryLock(
+    config.hostLocksDir,
+    name,
+    () => serviceCoordinationContext.run(lockPath, action),
+    {
+      timeoutMs: 60_000,
+      owner: {
+        stateDir: config.stateDir,
+        gatewayPort: config.gatewayPort,
+        proxyPort: config.proxyPort,
+        appServerPort: config.appServerPort,
+      },
+    },
+  );
 }
 
 function delay(ms) {
@@ -811,10 +855,12 @@ async function reclaimIdleCcCodexServices(config) {
     throw new UserError(
       `An older CC Codex routed process is still active (PID ${livePids.join(", ")}) and owns ` +
         `port ${config.proxyPort}. ` +
+      "This is a local service conflict, not a Codex login failure. " +
       "Close that Claude session, then run /codex:enable again.",
     );
   }
 
+  const stoppedPids = new Set();
   for (const [name, label] of [
     ["claude-gateway.pid.json", "older CC Codex gateway"],
     ["cliproxy.pid.json", "older CC Codex proxy"],
@@ -822,8 +868,16 @@ async function reclaimIdleCcCodexServices(config) {
   ]) {
     const path = join(stateDir, name);
     const record = readJson(path);
-    if (isPidAlive(record?.pid)) await stopPid(record.pid, label).catch(() => {});
+    if (isPidAlive(record?.pid)) {
+      await stopPid(record.pid, label).catch(() => {});
+      if (!isPidAlive(record.pid)) stoppedPids.add(record.pid);
+    }
     rmSync(path, { force: true });
+  }
+  // Older releases can leave the listener alive after its PID record is lost.
+  // The command and generated config above prove this PID is CC Codex-owned.
+  if (isPidAlive(owner.pid) && !stoppedPids.has(owner.pid)) {
+    await stopPid(owner.pid, "older CC Codex proxy").catch(() => {});
   }
   return true;
 }
@@ -893,6 +947,10 @@ function spawnDetached(binary, args, logPath, options = {}) {
 }
 
 export async function ensureProxy(config = getConfig()) {
+  return withServiceCoordination(config, () => ensureProxyCoordinated(config));
+}
+
+async function ensureProxyCoordinated(config, { forceRestart = false } = {}) {
   const { key } = ensureState(config);
   const localAuth = syncLocalCodexAuth(config);
   if (!localAuth.available) {
@@ -903,13 +961,13 @@ export async function ensureProxy(config = getConfig()) {
   const signature = (cmd, record) =>
     cmd.includes("cli-proxy-api") && traceModeMatches(config, record);
   const reusablePid = managedPid(config.proxyPidPath, signature);
-  if (reusablePid && await proxyReady(config)) {
+  if (!forceRestart && reusablePid && await proxyReady(config)) {
     return { pid: reusablePid, reused: true };
   }
 
   return withLock(config, "proxy", async () => {
     const lockedReusablePid = managedPid(config.proxyPidPath, signature);
-    if (lockedReusablePid && await proxyReady(config)) {
+    if (!forceRestart && lockedReusablePid && await proxyReady(config)) {
       return { pid: lockedReusablePid, reused: true };
     }
     const binary = await ensureProxyInstalled(config);
@@ -949,6 +1007,10 @@ export async function ensureProxy(config = getConfig()) {
 }
 
 export async function ensureAppServer(config = getConfig()) {
+  return withServiceCoordination(config, () => ensureAppServerCoordinated(config));
+}
+
+async function ensureAppServerCoordinated(config) {
   ensureState(config);
   if (await appServerReady(config)) {
     return {
@@ -998,6 +1060,10 @@ export async function ensureAppServer(config = getConfig()) {
 }
 
 export async function ensureGateway(config = getConfig()) {
+  return withServiceCoordination(config, () => ensureGatewayCoordinated(config));
+}
+
+async function ensureGatewayCoordinated(config) {
   ensureState(config);
   await ensureProxy(config);
   const signature = (cmd, record) =>
@@ -1119,6 +1185,13 @@ export function unregisterSession(config, { sessionId = null, claudePid = null }
 }
 
 export async function stopServices(config = getConfig(), { force = false } = {}) {
+  return withServiceCoordination(
+    config,
+    () => stopServicesCoordinated(config, { force }),
+  );
+}
+
+async function stopServicesCoordinated(config, { force = false } = {}) {
   const sessions = listSessions(config);
   if (sessions.length && !force) {
     throw new UserError(
@@ -1274,8 +1347,43 @@ export function codexAuthRecords(config = getConfig()) {
 }
 
 export async function getProxyModels(config = getConfig()) {
-  await ensureProxy(config);
-  const { key } = ensureState(config);
+  return withServiceCoordination(config, async () => {
+    await ensureProxyCoordinated(config);
+    const { key } = ensureState(config);
+    try {
+      return await fetchProxyModels(config, key);
+    } catch (error) {
+      if (!(error instanceof LocalProxyKeyMismatchError)) throw error;
+    }
+
+    await ensureProxyCoordinated(config, { forceRestart: true });
+    const { key: recoveredKey } = ensureState(config);
+    try {
+      return await fetchProxyModels(config, recoveredKey);
+    } catch (error) {
+      if (!(error instanceof LocalProxyKeyMismatchError)) throw error;
+      const owner = listeningProcess(config.proxyPort);
+      const ownerDetail = owner
+        ? ` Port ${config.proxyPort} is owned by PID ${owner.pid}: ${owner.command.slice(0, 500)}.`
+        : ` No process owner could be identified for port ${config.proxyPort}.`;
+      throw new UserError(
+        "CLIProxyAPI rejected CC Codex's private local key after automatic recovery. " +
+          "This is a local CC Codex service conflict, not a Codex login failure." +
+          ownerDetail +
+          " Close any older CC Codex session, then retry /codex:enable.",
+      );
+    }
+  });
+}
+
+class LocalProxyKeyMismatchError extends Error {
+  constructor() {
+    super("CLIProxyAPI rejected the current CC Codex private local key");
+    this.name = "LocalProxyKeyMismatchError";
+  }
+}
+
+async function fetchProxyModels(config, key) {
   let response;
   try {
     response = await fetchWithTimeout(
@@ -1293,7 +1401,14 @@ export async function getProxyModels(config = getConfig()) {
     throw new UserError(`Could not read CLIProxyAPI model catalog: ${error.message}`);
   }
   const text = await response.text();
-  if (!response.ok) throw new UserError(`CLIProxyAPI /v1/models returned ${response.status}: ${text}`);
+  if (response.status === 401 && isLocalProxyKeyRejection(text)) {
+    throw new LocalProxyKeyMismatchError();
+  }
+  if (!response.ok) {
+    throw new UserError(
+      `CLIProxyAPI /v1/models returned ${response.status}: ${redactDiagnostic(tailText(text))}`,
+    );
+  }
   let body;
   try {
     body = JSON.parse(text);
@@ -1304,6 +1419,15 @@ export async function getProxyModels(config = getConfig()) {
     ...model,
     rawId: decodeGatewayModelAlias(model.id) ?? decodeClaudeModelId(model.id),
   }));
+}
+
+function isLocalProxyKeyRejection(text) {
+  try {
+    const body = JSON.parse(text);
+    return body?.error === "Invalid API key";
+  } catch {
+    return /^\s*\{?\s*["']?error["']?\s*:\s*["']Invalid API key["']/i.test(text);
+  }
 }
 
 export async function getModelCatalog(config = getConfig()) {

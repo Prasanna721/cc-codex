@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -21,17 +21,22 @@ import {
   decodeClaudeModelId,
   decodeGatewayModelAlias,
   encodeClaudeModelId,
+  ensureProxy,
   ensureState,
   formatUsage,
   findLiveRoutedProcesses,
   gatewayAliasForModel,
   getConfig,
+  getProxyModels,
   indexPreferredProxyModels,
+  proxyBinaryPath,
   renderClaudeCodexSettings,
   renderProxyConfig,
   resolveSelectedModel,
   startupFailureMessage,
+  stopServices,
   syncLocalCodexAuth,
+  withServiceCoordination,
 } from "../plugins/cc-codex/lib/core.mjs";
 import {
   FAST_REQUEST_HEADER,
@@ -219,6 +224,135 @@ test("local Codex login is imported without modifying the native auth file", () 
       "proxy-refreshed-access-token",
     );
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("proxy catalog recovers once when the local private key is rejected after readiness", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cc-codex-proxy-key-recovery-"));
+  const config = testConfig(root, 29616);
+  try {
+    installFakeProxy(config);
+    writeFileSync(join(config.stateDir, "test-reject-second-model-request"), "1");
+
+    const models = await getProxyModels(config);
+
+    assert.equal(models.length, 1);
+    assert.equal(models[0].rawId, "test");
+    assert.equal(readFileSync(join(config.stateDir, "test-proxy-start-count"), "utf8"), "2");
+    assert.equal(existsSync(join(config.stateDir, "test-reject-second-model-request")), false);
+  } finally {
+    await stopServices(config, { force: true }).catch(() => {});
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("repeated local key rejection is reported as a service conflict, not Codex auth", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cc-codex-proxy-key-conflict-"));
+  const config = testConfig(root, 29916);
+  try {
+    installFakeProxy(config);
+    writeFileSync(join(config.stateDir, "test-always-reject-second-model-request"), "1");
+
+    await assert.rejects(
+      getProxyModels(config),
+      /private local key after automatic recovery.*not a Codex login failure/s,
+    );
+    assert.equal(readFileSync(join(config.stateDir, "test-proxy-start-count"), "utf8"), "2");
+  } finally {
+    await stopServices(config, { force: true }).catch(() => {});
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("machine-wide service coordination serializes matching ports across state directories", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cc-codex-service-lock-"));
+  const hostLocksDir = join(root, "host-locks");
+  const first = testConfig(join(root, "first"), 29516, { hostLocksDir });
+  const second = testConfig(join(root, "second"), 29516, { hostLocksDir });
+  const events = [];
+  let releaseFirst;
+  let firstAction = null;
+  let secondAction = null;
+  const firstGate = new Promise((resolvePromise) => { releaseFirst = resolvePromise; });
+  try {
+    firstAction = withServiceCoordination(first, async () => {
+      events.push("first:start");
+      await firstGate;
+      events.push("first:end");
+    });
+    while (!events.length) await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+    secondAction = withServiceCoordination(second, async () => {
+      events.push("second:start");
+      events.push("second:end");
+    });
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+    assert.deepEqual(events, ["first:start"]);
+    releaseFirst();
+    await Promise.all([firstAction, secondAction]);
+    assert.deepEqual(events, ["first:start", "first:end", "second:start", "second:end"]);
+  } finally {
+    releaseFirst?.();
+    await Promise.allSettled([firstAction, secondAction].filter(Boolean));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("machine-wide coordination replaces an idle cross-state proxy with a lost PID record", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cc-codex-cross-state-proxy-"));
+  const hostLocksDir = join(root, "host-locks");
+  const first = testConfig(join(root, "first"), 29716, { hostLocksDir });
+  const second = testConfig(join(root, "second"), 29716, { hostLocksDir });
+  let firstPid = null;
+  try {
+    installFakeProxy(first);
+    installFakeProxy(second);
+    firstPid = (await ensureProxy(first)).pid;
+    assert.equal(pidIsAlive(firstPid), true);
+    rmSync(first.proxyPidPath, { force: true });
+
+    const models = await getProxyModels(second);
+
+    assert.equal(models.length, 1);
+    assert.equal(existsSync(first.proxyPidPath), false);
+    assert.equal(pidIsAlive(firstPid), false);
+    const secondPid = JSON.parse(readFileSync(second.proxyPidPath, "utf8")).pid;
+    assert.notEqual(secondPid, firstPid);
+    assert.equal(pidIsAlive(secondPid), true);
+    assert.equal(first.hostLocksDir, second.hostLocksDir);
+  } finally {
+    await stopServices(second, { force: true }).catch(() => {});
+    await stopServices(first, { force: true }).catch(() => {});
+    if (firstPid && pidIsAlive(firstPid)) process.kill(firstPid, "SIGKILL");
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cross-state recovery preserves a live routed session and reports a local conflict", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cc-codex-live-cross-state-proxy-"));
+  const hostLocksDir = join(root, "host-locks");
+  const first = testConfig(join(root, "first"), 29816, { hostLocksDir });
+  const second = testConfig(join(root, "second"), 29816, { hostLocksDir });
+  let firstPid = null;
+  try {
+    installFakeProxy(first);
+    installFakeProxy(second);
+    firstPid = (await ensureProxy(first)).pid;
+    writeFileSync(
+      join(first.sessionsDir, `${SESSION_A}.json`),
+      `${JSON.stringify({ sessionId: SESSION_A, claudePid: process.pid })}\n`,
+      { mode: 0o600 },
+    );
+
+    await assert.rejects(
+      getProxyModels(second),
+      /local service conflict, not a Codex login failure/,
+    );
+    assert.equal(pidIsAlive(firstPid), true);
+  } finally {
+    await stopServices(first, { force: true }).catch(() => {});
+    await stopServices(second, { force: true }).catch(() => {});
+    if (firstPid && pidIsAlive(firstPid)) process.kill(firstPid, "SIGKILL");
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -884,6 +1018,7 @@ function runSessionHook(config, { input, environment = {} }) {
         CLAUDE_PLUGIN_DATA: config.stateDir,
         CLAUDE_CODEX_STATE_DIR: config.stateDir,
         CLAUDE_CODEX_RUNTIME_DIR: config.runtimeDir,
+        CLAUDE_CODEX_HOST_LOCKS_DIR: config.hostLocksDir,
         CLAUDE_CODEX_GATEWAY_PORT: String(config.gatewayPort),
         CLAUDE_CODEX_PROXY_PORT: String(config.proxyPort),
         CLAUDE_CODEX_APP_SERVER_PORT: String(config.appServerPort),
@@ -903,7 +1038,44 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function testConfig(root, gatewayPort) {
+function installFakeProxy(config) {
+  writeFakeLocalCodexAuth(config);
+  ensureState(config);
+  const binary = proxyBinaryPath(config);
+  const fixture = join(ROOT, "..", "..", "test-fixtures", "cli-proxy-api.mjs");
+  mkdirSync(dirname(binary), { recursive: true });
+  writeFileSync(binary, readFileSync(fixture), { mode: 0o755 });
+  chmodSync(binary, 0o755);
+}
+
+function writeFakeLocalCodexAuth(config) {
+  mkdirSync(config.codexHome, { recursive: true });
+  writeFileSync(config.localCodexAuthPath, `${JSON.stringify({
+    auth_mode: "chatgpt",
+    tokens: {
+      access_token: "test-access-token",
+      refresh_token: "test-refresh-token",
+      id_token: fakeJwt({
+        exp: 2_000_000_000,
+        "https://api.openai.com/auth": { chatgpt_account_id: "test-account" },
+      }),
+      account_id: "test-account",
+    },
+    last_refresh: "2026-07-14T12:00:00.000Z",
+  }, null, 2)}\n`, { mode: 0o600 });
+}
+
+function pidIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+function testConfig(root, gatewayPort, { hostLocksDir = join(root, "host-locks") } = {}) {
   const config = getConfig({
     stateDir: join(root, "state"),
     runtimeDir: join(root, "runtime"),
@@ -911,6 +1083,7 @@ function testConfig(root, gatewayPort) {
     zshrcPath: join(root, "home", ".zshrc"),
     codexHome: join(root, "codex-home"),
     legacyResumeHelperPath: join(root, "bin", "codex-mode"),
+    hostLocksDir,
     gatewayPort,
     proxyPort: gatewayPort + 1,
     appServerPort: gatewayPort + 2,

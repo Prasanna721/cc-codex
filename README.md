@@ -35,6 +35,8 @@ CC Codex uses the login already held by the local Codex CLI. If Codex is not sig
 
 That command runs `codex login`. It is only needed when the local credential is missing.
 
+The plugin's private loopback API key is separate from the Codex login. If an idle proxy from an older installation owns the local ports with a different key, CC Codex recovers it automatically; a live older routed session is preserved and reported as a local service conflict.
+
 After enable, exit Claude with Ctrl+C twice. On the first enable, the current shell has not loaded the launcher yet, so `/codex:enable` prints one exact relaunch command like this:
 
 ```sh

@@ -73,7 +73,7 @@ Routed sessions share three loopback-only processes:
 - `127.0.0.1:18317` — pinned CLIProxyAPI protocol translator.
 - `127.0.0.1:18318` — native Codex app-server for model discovery and usage.
 
-Locks and authenticated health checks prevent duplicate startup and detect a process using a stale private key. An idle CC Codex stack from an older plugin data directory is reclaimed; an active older session produces an actionable error instead. The final disabled and exited route stops idle services. Startup errors include a redacted tail of the service log in Claude.
+A per-user machine-wide lock coordinates the complete enable transaction across plugin data directories. Authenticated health checks detect a process using a stale private key. An idle CC Codex stack from an older plugin data directory is reclaimed, even if its proxy PID record is missing; an active older session is preserved and produces an actionable local-conflict error instead. A key rejection between readiness and model discovery triggers one restart and authenticated retry. The final disabled and exited route stops idle services. Startup errors include a redacted tail of the service log in Claude.
 
 ## Request latency and tracing
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.2
+
+- Coordinates service startup across plugin data directories with one per-user lock.
+- Recovers an idle CLIProxyAPI that is using an older private local key, including when its PID record is missing.
+- Retries model discovery once after a local key rejection and distinguishes that conflict from Codex authentication.
+- Preserves an older proxy when it still owns a live routed Claude session and reports the conflicting PID.
+
 ## 0.9.1
 
 - Prints one exact first-time relaunch command after `/codex:enable`; no `exec zsh` step.

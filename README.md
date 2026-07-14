@@ -72,7 +72,7 @@ CLIProxyAPI is an internal protocol adapter, not an authentication command. It i
 
 Fast mode is enabled only when the selected model advertises the Codex priority service tier. It takes effect on the next request and consumes credits faster than Standard mode.
 
-Routed sessions suppress Claude's nonessential background model traffic. This keeps one user prompt from silently becoming an extra Codex request while leaving the configured model picker available.
+Routed sessions keep Claude's gateway model discovery enabled so `/model` shows the complete live Codex catalog and its effort selector. Disabling Claude's nonessential traffic also disables that discovery and is therefore intentionally not forced by CC Codex.
 
 See [plugins/cc-codex/docs/ARCHITECTURE.md](plugins/cc-codex/docs/ARCHITECTURE.md) for the routing design.
 

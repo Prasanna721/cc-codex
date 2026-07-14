@@ -7,7 +7,7 @@
 - Surfaces startup failures and redacted service log tails instead of hiding them in log files.
 - Detects stale CC Codex services from an older plugin data directory, reclaims them only when idle, and refuses when a live routed process exists even if its session marker is stale.
 - Adds catalog-aware `/codex:fast [on|off|status]` for per-conversation Fast mode.
-- Suppresses Claude's nonessential background model request in routed sessions.
+- Keeps gateway model discovery active so `/model` shows every available Codex model and the effort selector.
 - Adds redacted per-request timing traces and an isolated mock/live latency benchmark.
 
 ## 0.8.1

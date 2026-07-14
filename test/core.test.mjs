@@ -17,6 +17,7 @@ import test from "node:test";
 
 import {
   ROOT,
+  buildClaudeCodexEnvironment,
   decodeClaudeModelId,
   decodeGatewayModelAlias,
   encodeClaudeModelId,
@@ -293,10 +294,14 @@ test("per-session settings contain the gateway and private session header withou
     assert.equal(settings.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:29416");
     assert.equal(settings.env.ANTHROPIC_AUTH_TOKEN.length, 64);
     assert.equal(settings.env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY, "1");
-    assert.equal(settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "1");
+    assert.equal(settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "");
     assert.equal(settings.env.CLAUDE_CODE_USE_BEDROCK, "");
     assert.equal(settings.env.CLAUDE_CODEX_STATE_DIR, config.stateDir);
     assert.match(settings.env.ANTHROPIC_CUSTOM_HEADERS, new RegExp(`${SESSION_REQUEST_HEADER}: ${SESSION_A}`));
+    const launchEnvironment = buildClaudeCodexEnvironment(config, model, {
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    }, { sessionId: SESSION_A });
+    assert.equal("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" in launchEnvironment, false);
     assert.equal(existsSync(config.claudeUserSettingsPath), false);
   } finally {
     rmSync(root, { recursive: true, force: true });

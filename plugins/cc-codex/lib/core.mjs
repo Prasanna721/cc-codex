@@ -374,7 +374,6 @@ export function buildClaudeCodexEnvironment(
     ANTHROPIC_BASE_URL: config.gatewayBaseUrl,
     ANTHROPIC_AUTH_TOKEN: key,
     ANTHROPIC_CUSTOM_HEADERS: [...routingHeaders, ...existingHeaders].join("\n"),
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "1",
     CLAUDE_CODE_SUBAGENT_MODEL: "inherit",
     CLAUDE_CODEX_ACTIVE: "1",
@@ -385,6 +384,9 @@ export function buildClaudeCodexEnvironment(
     CLAUDE_CODEX_PROXY_PORT: String(config.proxyPort),
     CLAUDE_CODEX_APP_SERVER_PORT: String(config.appServerPort),
   });
+  // Claude classifies gateway model discovery as nonessential traffic. Leaving
+  // this flag enabled reduces /model to Default plus the current custom model.
+  delete environment.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC;
   return environment;
 }
 
@@ -398,7 +400,11 @@ export function renderClaudeCodexSettings(
     CLAUDE_PROVIDER_ENV_KEYS.map((name) => [name, ""]),
   );
   const active = buildClaudeCodexEnvironment(config, proxyModelId, {}, { sessionId });
-  Object.assign(environment, active);
+  Object.assign(environment, active, {
+    // A settings file cannot delete an inherited variable. Claude treats the
+    // empty value as disabled and will fetch the complete gateway model list.
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "",
+  });
   return {
     $schema: "https://json.schemastore.org/claude-code-settings.json",
     model: proxyModelId,

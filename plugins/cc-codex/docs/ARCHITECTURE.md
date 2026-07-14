@@ -93,7 +93,7 @@ Set `CLAUDE_CODEX_TRACE=1` before starting a routed session to write correlated 
 
 The development harness, `npm run benchmark:trace`, measures the gateway alone and the gateway plus translator against deterministic mock streams at 1 KiB, 100 KiB, and 1 MiB. `npm run benchmark:trace -- --real --real-runs 1` adds bounded live requests through the direct bridge, Claude's bare harness, Claude's normal safe-mode harness, and native `codex exec`.
 
-Routed settings set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. Claude's model catalog is already present in the private session settings, so this avoids background model calls without removing the routed models from `/model`.
+Routed settings explicitly leave `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` disabled. Claude classifies gateway model discovery as nonessential; enabling that flag reduces `/model` to Default plus the current custom model even when every Codex model is present in `availableModels`. Keeping discovery active exposes the complete live Codex catalog and Claude's effort selector.
 
 ## State
 

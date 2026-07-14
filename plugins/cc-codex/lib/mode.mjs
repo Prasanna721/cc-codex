@@ -6,6 +6,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   readdirSync,
   readSync,
   renameSync,
@@ -30,6 +31,12 @@ import {
   resolveSelectedModel,
   syncLocalCodexAuth,
 } from "./core.mjs";
+import {
+  fastModelIds,
+  modelSupportsFast,
+  recordSupportsFast,
+  recordUsesFast,
+} from "./fast.mjs";
 
 const ROUTE_VERSION = 1;
 const MODE_VERSION = 1;
@@ -165,6 +172,61 @@ export function terminalModeStatus(config, {
   };
 }
 
+export function pendingRouteNotice(config, {
+  terminalIdentity,
+  cwd,
+  shellIntegrationActive = false,
+  bypassReason = null,
+} = {}) {
+  const intentionalBypasses = new Set([
+    "bypass requested",
+    "different resume target",
+    "explicit Claude launch mode",
+  ]);
+  if (intentionalBypasses.has(bypassReason)) return null;
+
+  let route = null;
+  try {
+    route = readTerminalRoute(config, terminalIdentity);
+  } catch {
+    // A normal Claude launch without a pending route should remain untouched.
+  }
+
+  if (!route) {
+    if (["invalid route state", "session settings missing", "route planning failed"].includes(bypassReason)) {
+      return "CC Codex could not use its saved route because the route state is invalid. " +
+        "Run /codex:enable again in this conversation.";
+    }
+    return null;
+  }
+
+  const mode = readSessionMode(config, route.sessionId);
+  if (!mode) {
+    return "CC Codex found a terminal route without valid session settings. " +
+      "Run /codex:enable again in this conversation.";
+  }
+
+  const launchCwd = resolve(String(cwd || process.cwd()));
+  if (!samePath(launchCwd, route.cwd)) {
+    const command = shellIntegrationActive
+      ? `cd ${shellQuote(route.cwd)} && claude`
+      : `cd ${shellQuote(route.cwd)} && ${shellActivationCommand(config)}`;
+    return "CC Codex did not route this launch because it started from a different directory.\n\n" +
+      `Exit Claude, then run exactly:\n${command}`;
+  }
+
+  if (!shellIntegrationActive) {
+    return "CC Codex was enabled, but this shell has not loaded the CC Codex launcher.\n\n" +
+      `Exit Claude, then run exactly:\n${shellActivationCommand(config)}`;
+  }
+
+  if (bypassReason) {
+    return `CC Codex did not route this launch: ${bypassReason}. ` +
+      "Run /codex:enable again in this conversation.";
+  }
+  return null;
+}
+
 export async function prepareTerminalSessionMode(config, {
   sessionId,
   cwd,
@@ -194,6 +256,9 @@ export async function prepareTerminalSessionMode(config, {
   const selected = resolveSelectedModel(catalog, preferredModel);
   const proxyModelId = selected.proxy.id;
   const availableModels = catalog.available.map((model) => model.proxy.id);
+  const supportedFastModels = fastModelIds(catalog.available);
+  const selectedSupportsFast = supportedFastModels.includes(selected.id) ||
+    supportedFastModels.includes(selected.model);
   const settingsPath = sessionSettingsPath(config, id);
   const now = new Date().toISOString();
   const record = {
@@ -205,6 +270,8 @@ export async function prepareTerminalSessionMode(config, {
     selectedModelId: selected.id,
     selectedModelDisplayName: selected.displayName ?? selected.id,
     availableModels,
+    fastModelIds: supportedFastModels,
+    fastMode: previous?.fastMode === true && selectedSupportsFast,
     settingsPath,
     terminal,
     forceModelOnNextLaunch: true,
@@ -277,6 +344,80 @@ export function updateSessionFromTranscript(config, {
   return updated;
 }
 
+export async function setSessionFastMode(config, {
+  sessionId,
+  action = "toggle",
+  catalog = null,
+} = {}) {
+  restoreLegacyGlobalMode(config);
+  ensureState(config);
+  const id = validateSessionId(sessionId);
+  const record = readSessionMode(config, id);
+  if (!record) {
+    throw new UserError("Codex is not enabled for this conversation. Run /codex:enable first.");
+  }
+
+  const normalizedAction = String(action || "toggle").trim().toLowerCase();
+  if (!["toggle", "on", "off", "status"].includes(normalizedAction)) {
+    throw new UserError("Usage: /codex:fast [on|off|status]");
+  }
+
+  const liveCatalog = catalog ?? await getModelCatalog(config);
+  const current = liveCatalog.available.find((model) =>
+    model.id === record.selectedModelId || model.model === record.selectedModelId ||
+    model.proxy?.id === record.proxyModelId,
+  );
+  if (!current) {
+    throw new UserError(
+      `The selected Codex model ${record.selectedModelId} is no longer available. Use /model first.`,
+    );
+  }
+
+  const supportedIds = fastModelIds(liveCatalog.available);
+  const supported = modelSupportsFast(current);
+  const wasEnabled = record.fastMode === true && supported;
+  if (!supported && ["toggle", "on"].includes(normalizedAction)) {
+    const alternatives = liveCatalog.available
+      .filter(modelSupportsFast)
+      .map((model) => model.displayName ?? model.id)
+      .join(", ");
+    throw new UserError(
+      `${current.displayName ?? current.id} does not offer Codex Fast mode.` +
+        (alternatives ? ` Use /model and choose one of: ${alternatives}.` : ""),
+    );
+  }
+
+  let enabled = wasEnabled;
+  if (normalizedAction === "toggle") enabled = !wasEnabled;
+  else if (normalizedAction === "on") enabled = true;
+  else if (normalizedAction === "off") enabled = false;
+
+  const updated = {
+    ...record,
+    selectedModelDisplayName: current.displayName ?? current.id,
+    fastModelIds: supportedIds,
+    fastMode: enabled && supported,
+    updatedAt: new Date().toISOString(),
+  };
+  writeSettingsForMode(config, updated);
+  writeJson(sessionModePath(config, id), updated);
+  return {
+    action: normalizedAction,
+    enabled: recordUsesFast(updated),
+    supported,
+    changed: recordUsesFast(updated) !== wasEnabled,
+    modelId: current.id,
+    modelDisplayName: current.displayName ?? current.id,
+  };
+}
+
+export function sessionFastStatus(record) {
+  return {
+    supported: recordSupportsFast(record),
+    enabled: recordUsesFast(record),
+  };
+}
+
 export function installShellIntegration(config, { environment = process.env } = {}) {
   ensureState(config);
   if (!existsSync(config.terminalLauncherSourcePath)) {
@@ -303,9 +444,18 @@ export function installShellIntegration(config, { environment = process.env } = 
 
   return {
     zshrcPath: config.zshrcPath,
+    integrationPath: config.shellIntegrationPath,
+    activationCommand: shellActivationCommand(config),
     changed,
-    activeInCurrentShell: environment.CLAUDE_CODEX_SHELL_INTEGRATION === "1",
+    activeInCurrentShell:
+      environment.CLAUDE_CODEX_SHELL_INTEGRATION === "1" &&
+      typeof environment.CLAUDE_CODEX_STATE_DIR === "string" &&
+      samePath(environment.CLAUDE_CODEX_STATE_DIR, config.stateDir),
   };
+}
+
+export function shellActivationCommand(config) {
+  return `source ${shellQuote(config.shellIntegrationPath)} && claude`;
 }
 
 export function restoreLegacyGlobalMode(config) {
@@ -386,10 +536,12 @@ function cleanLegacyGlobalSettings(config) {
   }
   if (env.ANTHROPIC_BASE_URL === config.gatewayBaseUrl) delete env.ANTHROPIC_BASE_URL;
   if (isLocalProxyKey(config, env.ANTHROPIC_AUTH_TOKEN)) delete env.ANTHROPIC_AUTH_TOKEN;
-  if (String(env.ANTHROPIC_CUSTOM_HEADERS ?? "").includes("x-claude-codex-model:")) {
+  if (/^\s*x-(?:claude-codex-model|cc-codex-(?:session|fast))\s*:/im.test(
+    String(env.ANTHROPIC_CUSTOM_HEADERS ?? ""),
+  )) {
     const remaining = String(env.ANTHROPIC_CUSTOM_HEADERS)
       .split("\n")
-      .filter((line) => !/^\s*x-claude-codex-model\s*:/i.test(line))
+      .filter((line) => !/^\s*x-(?:claude-codex-model|cc-codex-(?:session|fast))\s*:/i.test(line))
       .filter((line) => line.trim());
     if (remaining.length) env.ANTHROPIC_CUSTOM_HEADERS = remaining.join("\n");
     else delete env.ANTHROPIC_CUSTOM_HEADERS;
@@ -419,11 +571,18 @@ function updateRecordModel(record, model) {
     proxyModelId: model,
     selectedModelId,
     selectedModelDisplayName: selectedModelId,
+    fastMode: record.fastMode === true && Array.isArray(record.fastModelIds) &&
+      record.fastModelIds.includes(selectedModelId),
   };
 }
 
 function writeSettingsForMode(config, record) {
-  const settings = renderClaudeCodexSettings(config, record.proxyModelId, record.availableModels);
+  const settings = renderClaudeCodexSettings(
+    config,
+    record.proxyModelId,
+    record.availableModels,
+    { sessionId: record.sessionId },
+  );
   writeAtomic(record.settingsPath, `${JSON.stringify(settings, null, 2)}\n`, 0o600);
 }
 
@@ -616,7 +775,11 @@ function removeLegacyResumeArtifacts(config) {
 function isLegacyManagedEnvironment(name, value, config) {
   if (name.startsWith("CLAUDE_CODEX_")) return true;
   if (name === "ANTHROPIC_BASE_URL") return value === config.gatewayBaseUrl;
-  if (name === "ANTHROPIC_CUSTOM_HEADERS") return String(value ?? "").includes("x-claude-codex-model:");
+  if (name === "ANTHROPIC_CUSTOM_HEADERS") {
+    return /^\s*x-(?:claude-codex-model|cc-codex-(?:session|fast))\s*:/im.test(
+      String(value ?? ""),
+    );
+  }
   if (name === "ANTHROPIC_AUTH_TOKEN") return isLocalProxyKey(config, value);
   return false;
 }
@@ -658,6 +821,14 @@ function isCodexModelList(value) {
 
 function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'\\''`)}'`;
+}
+
+function samePath(left, right) {
+  try {
+    return realpathSync(resolve(left)) === realpathSync(resolve(right));
+  } catch {
+    return resolve(left) === resolve(right);
+  }
 }
 
 function readJson(path) {

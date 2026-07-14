@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -21,24 +22,37 @@ import {
   encodeClaudeModelId,
   ensureState,
   formatUsage,
+  findLiveRoutedProcesses,
   gatewayAliasForModel,
   getConfig,
   indexPreferredProxyModels,
   renderClaudeCodexSettings,
   renderProxyConfig,
   resolveSelectedModel,
+  startupFailureMessage,
   syncLocalCodexAuth,
 } from "../plugins/cc-codex/lib/core.mjs";
+import {
+  FAST_REQUEST_HEADER,
+  SESSION_REQUEST_HEADER,
+  applySessionRoutingHeaders,
+  fastModelIds,
+  modelSupportsFast,
+} from "../plugins/cc-codex/lib/fast.mjs";
 import {
   disableSessionMode,
   installShellIntegration,
   markSessionStarted,
   normalizeTerminalIdentity,
+  pendingRouteNotice,
   prepareTerminalSessionMode,
   readSessionMode,
   restoreLegacyGlobalMode,
+  sessionFastStatus,
   sessionModePath,
   sessionSettingsPath,
+  setSessionFastMode,
+  shellActivationCommand,
   terminalRoutePath,
 } from "../plugins/cc-codex/lib/mode.mjs";
 import {
@@ -76,8 +90,34 @@ test("state generation binds the proxy to loopback and protects its key", () => 
     assert.match(generated, /host: "127\.0\.0\.1"/);
     assert.match(generated, /port: 28417/);
     assert.match(generated, new RegExp(key));
+    assert.match(
+      generated,
+      /protocol: "codex"\n          headers:\n            X-CC-Codex-Fast: "1"\n      params:\n        service_tier: "priority"/,
+    );
     assert.equal(generated, renderProxyConfig(config, key));
     assert.equal(statSync(config.proxyKeyPath).mode & 0o777, 0o600);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("trace mode enables the private CLIProxy timing queue without changing the default", () => {
+  const root = mkdtempSync(join(tmpdir(), "cc-codex-trace-config-"));
+  try {
+    const normal = testConfig(root, 28516);
+    const traced = getConfig({
+      stateDir: join(root, "trace-state"),
+      runtimeDir: join(root, "trace-runtime"),
+      gatewayPort: 28616,
+      proxyPort: 28617,
+      appServerPort: 28618,
+      traceEnabled: true,
+      tracePath: join(root, "trace-state", "custom-trace.jsonl"),
+    });
+    assert.match(renderProxyConfig(normal, "a".repeat(64)), /usage-statistics-enabled: false/);
+    assert.match(renderProxyConfig(traced, "b".repeat(64)), /usage-statistics-enabled: true/);
+    assert.equal(traced.traceEnabled, true);
+    assert.equal(traced.tracePath, join(root, "trace-state", "custom-trace.jsonl"));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -115,6 +155,8 @@ test("plugin commands use private scripts and leave model selection to /model", 
   }
   assert.equal(existsSync(join(ROOT, "commands", "enable.md")), true);
   assert.equal(existsSync(join(ROOT, "commands", "disable.md")), true);
+  assert.equal(existsSync(join(ROOT, "commands", "fast.md")), true);
+  assert.equal(existsSync(join(ROOT, "scripts", "fast-mode.mjs")), true);
   assert.equal(existsSync(join(ROOT, "commands", "models.md")), false);
   assert.equal(existsSync(join(ROOT, "skills", "models")), false);
   assert.equal(existsSync(join(ROOT, "bin", "claude-codex")), false);
@@ -239,22 +281,114 @@ test("usage formatting matches Codex's 20-segment remaining-limit bars", () => {
   assert.match(output, /1,234,567/);
 });
 
-test("per-session settings contain the gateway without touching user settings", () => {
+test("per-session settings contain the gateway and private session header without touching user settings", () => {
   const root = mkdtempSync(join(tmpdir(), "claude-codex-settings-"));
   try {
     const config = testConfig(root, 29416);
     const model = gatewayAliasForModel("gpt-5.4-mini");
-    const settings = renderClaudeCodexSettings(config, model);
+    const settings = renderClaudeCodexSettings(config, model, [model], { sessionId: SESSION_A });
     assert.equal(settings.model, model);
     assert.deepEqual(settings.availableModels, [model]);
     assert.equal(settings.enforceAvailableModels, true);
     assert.equal(settings.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:29416");
     assert.equal(settings.env.ANTHROPIC_AUTH_TOKEN.length, 64);
     assert.equal(settings.env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY, "1");
-    assert.equal(settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "");
+    assert.equal(settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "1");
     assert.equal(settings.env.CLAUDE_CODE_USE_BEDROCK, "");
     assert.equal(settings.env.CLAUDE_CODEX_STATE_DIR, config.stateDir);
+    assert.match(settings.env.ANTHROPIC_CUSTOM_HEADERS, new RegExp(`${SESSION_REQUEST_HEADER}: ${SESSION_A}`));
     assert.equal(existsSync(config.claudeUserSettingsPath), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Fast mode follows the live model catalog and is applied per request", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cc-codex-fast-"));
+  try {
+    const config = testConfig(root, 29916);
+    ensureState(config);
+    const supportedAlias = gatewayAliasForModel("gpt-5.6-sol");
+    const unsupportedAlias = gatewayAliasForModel("gpt-5.4-mini");
+    const supported = {
+      id: "gpt-5.6-sol",
+      model: "gpt-5.6-sol",
+      displayName: "GPT-5.6 Sol",
+      serviceTiers: [{ id: "priority", displayName: "Fast" }],
+      proxy: { id: supportedAlias },
+    };
+    const unsupported = {
+      id: "gpt-5.4-mini",
+      model: "gpt-5.4-mini",
+      displayName: "GPT-5.4 mini",
+      serviceTiers: [],
+      proxy: { id: unsupportedAlias },
+    };
+    const catalog = { available: [supported, unsupported] };
+    const ids = fastModelIds(catalog.available);
+    assert.equal(modelSupportsFast(supported), true);
+    assert.equal(modelSupportsFast(unsupported), false);
+    assert.deepEqual(new Set(ids), new Set(["gpt-5.6-sol", supportedAlias]));
+
+    const terminal = normalizeTerminalIdentity({ shellPid: 4040, tty: "ttys040" });
+    writeMode(config, {
+      sessionId: SESSION_A,
+      terminal,
+      model: supportedAlias,
+      fastModelIds: ids,
+    });
+    const enabled = await setSessionFastMode(config, {
+      sessionId: SESSION_A,
+      action: "on",
+      catalog,
+    });
+    assert.deepEqual(
+      { enabled: enabled.enabled, supported: enabled.supported, changed: enabled.changed },
+      { enabled: true, supported: true, changed: true },
+    );
+    assert.deepEqual(sessionFastStatus(readSessionMode(config, SESSION_A)), {
+      supported: true,
+      enabled: true,
+    });
+
+    const routedHeaders = applySessionRoutingHeaders({
+      [SESSION_REQUEST_HEADER]: SESSION_A,
+      [FAST_REQUEST_HEADER]: "malicious-client-value",
+      "content-type": "application/json",
+    }, config.stateDir, { modelId: supportedAlias });
+    assert.equal(routedHeaders[SESSION_REQUEST_HEADER], undefined);
+    assert.equal(routedHeaders[FAST_REQUEST_HEADER], "1");
+    assert.equal(routedHeaders["content-type"], "application/json");
+
+    const unsupportedHeaders = applySessionRoutingHeaders({
+      [SESSION_REQUEST_HEADER]: SESSION_A,
+    }, config.stateDir, { modelId: unsupportedAlias });
+    assert.equal(unsupportedHeaders[FAST_REQUEST_HEADER], undefined);
+
+    const status = await setSessionFastMode(config, {
+      sessionId: SESSION_A,
+      action: "status",
+      catalog,
+    });
+    assert.equal(status.enabled, true);
+    assert.equal(status.changed, false);
+    const disabled = await setSessionFastMode(config, {
+      sessionId: SESSION_A,
+      action: "off",
+      catalog,
+    });
+    assert.equal(disabled.enabled, false);
+
+    writeMode(config, {
+      sessionId: SESSION_B,
+      terminal: normalizeTerminalIdentity({ shellPid: 4141, tty: "ttys041" }),
+      model: unsupportedAlias,
+      fastModelIds: ids,
+    });
+    await assert.rejects(
+      setSessionFastMode(config, { sessionId: SESSION_B, action: "on", catalog }),
+      /does not offer Codex Fast mode.*GPT-5\.6 Sol/,
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -306,6 +440,55 @@ test("terminal launcher routes only the matching shell, cwd, and session", () =>
     assert.equal(matchingResume.routed, true);
     assert.equal(matchingResume.args.filter((arg) => arg === "--resume").length, 1);
     assert.deepEqual(terminalKey(4242, "/dev/ttys042"), terminal);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pending routes produce an exact recovery command instead of silently using Claude", () => {
+  const root = mkdtempSync(join(tmpdir(), "cc-codex-pending-route-"));
+  try {
+    const config = testConfig(root, 30916);
+    ensureState(config);
+    const terminal = normalizeTerminalIdentity({ shellPid: 4343, tty: "ttys043" });
+    const model = gatewayAliasForModel("gpt-5.6-sol");
+    writeMode(config, { sessionId: SESSION_A, terminal, model });
+
+    const firstLaunch = pendingRouteNotice(config, {
+      terminalIdentity: terminal,
+      cwd: root,
+      shellIntegrationActive: false,
+    });
+    assert.match(firstLaunch, /shell has not loaded the CC Codex launcher/);
+    assert.match(firstLaunch, new RegExp(escapeRegExp(shellActivationCommand(config))));
+
+    const wrongDirectory = pendingRouteNotice(config, {
+      terminalIdentity: terminal,
+      cwd: join(root, "elsewhere"),
+      shellIntegrationActive: true,
+      bypassReason: "working directory changed",
+    });
+    assert.match(wrongDirectory, new RegExp(escapeRegExp(`cd '${root}' && claude`)));
+    assert.equal(pendingRouteNotice(config, {
+      terminalIdentity: terminal,
+      cwd: root,
+      shellIntegrationActive: true,
+      bypassReason: "explicit Claude launch mode",
+    }), null);
+
+    rmSync(sessionSettingsPath(config, SESSION_A));
+    const plan = buildLaunchPlan([], {
+      CLAUDE_CODEX_STATE_DIR: config.stateDir,
+      CLAUDE_CODEX_SHELL_PID: String(terminal.shellPid),
+      CLAUDE_CODEX_TTY: terminal.tty,
+    }, root);
+    assert.equal(plan.reason, "session settings missing");
+    assert.match(pendingRouteNotice(config, {
+      terminalIdentity: terminal,
+      cwd: root,
+      shellIntegrationActive: true,
+      bypassReason: plan.reason,
+    }), /Run \/codex:enable again/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -379,9 +562,23 @@ test("shell integration preserves zshrc, migrates the old marker, and stays idem
     writeFileSync(config.zshrcPath, originalZshrc, { mode: 0o644 });
     const first = installShellIntegration(config, { environment: {} });
     const second = installShellIntegration(config, { environment: {} });
+    const staleLauncher = installShellIntegration(config, {
+      environment: {
+        CLAUDE_CODEX_SHELL_INTEGRATION: "1",
+        CLAUDE_CODEX_STATE_DIR: join(root, "old-plugin-data"),
+      },
+    });
+    const currentLauncher = installShellIntegration(config, {
+      environment: {
+        CLAUDE_CODEX_SHELL_INTEGRATION: "1",
+        CLAUDE_CODEX_STATE_DIR: config.stateDir,
+      },
+    });
     const zshrc = readFileSync(config.zshrcPath, "utf8");
     assert.equal(first.changed, true);
     assert.equal(second.changed, false);
+    assert.equal(staleLauncher.activeInCurrentShell, false);
+    assert.equal(currentLauncher.activeInCurrentShell, true);
     assert.match(zshrc, /export KEEP_ME=yes/);
     assert.equal((zshrc.match(/>>> cc-codex/g) ?? []).length, 1);
     assert.equal((zshrc.match(/>>> claude-codex-mode/g) ?? []).length, 0);
@@ -391,6 +588,160 @@ test("shell integration preserves zshrc, migrates the old marker, and stays idem
     assert.equal(statSync(config.zshrcPath).mode & 0o777, 0o644);
     assert.equal(spawnSync("zsh", ["-n", config.shellIntegrationPath]).status, 0);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the first-enable copy command routes the same terminal while plain claude does not", () => {
+  const root = mkdtempSync(join(tmpdir(), "cc-codex-first-enable-"));
+  try {
+    const config = testConfig(root, 33916);
+    mkdirSync(join(root, "bin"), { recursive: true });
+    const fakeClaude = join(root, "bin", "claude");
+    writeFileSync(
+      fakeClaude,
+      "#!/bin/sh\n" +
+        "printf 'FAKE_ACTIVE=%s\\n' \"${CLAUDE_CODEX_ACTIVE:-}\"\n" +
+        "for arg in \"$@\"; do printf 'FAKE_ARG=%s\\n' \"$arg\"; done\n",
+      { mode: 0o755 },
+    );
+    chmodSync(fakeClaude, 0o755);
+    const fakeTty = join(root, "bin", "tty");
+    writeFileSync(fakeTty, "#!/bin/sh\nprintf '/dev/ttys-cc-codex-test\\n'\n", { mode: 0o755 });
+    chmodSync(fakeTty, 0o755);
+    const shell = installShellIntegration(config, { environment: {} });
+    const fixture = join(ROOT, "..", "..", "test-fixtures", "prepare-shell-route.mjs");
+    const command = [
+      "unset CLAUDE_CODEX_ACTIVE CLAUDE_CODEX_ROUTED CLAUDE_CODEX_SESSION_ID CLAUDE_CODEX_TERMINAL_KEY",
+      `export PATH=${shellQuoteForTest(join(root, "bin"))}:$PATH`,
+      `${shellQuoteForTest(process.execPath)} ${shellQuoteForTest(fixture)} ` +
+        `${shellQuoteForTest(config.stateDir)} ${shellQuoteForTest(root)} ${SESSION_A} "$$" "$(tty)"`,
+      "printf 'PLAIN\\n'",
+      "claude",
+      "printf 'ACTIVATED\\n'",
+      shell.activationCommand,
+    ].join("\n");
+    const result = spawnSync("/bin/zsh", ["-f", "-c", command], {
+      cwd: root,
+      encoding: "utf8",
+      env: { ...process.env },
+    });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    const output = result.stdout.replaceAll("\r", "");
+    const plain = output.slice(output.indexOf("PLAIN\n"), output.indexOf("ACTIVATED\n"));
+    const activated = output.slice(output.indexOf("ACTIVATED\n"));
+    assert.match(plain, /FAKE_ACTIVE=\n/);
+    assert.doesNotMatch(plain, /FAKE_ARG=--settings/);
+    assert.match(activated, /FAKE_ACTIVE=1\n/, result.stderr);
+    assert.match(activated, /FAKE_ARG=--settings\n/);
+    assert.match(activated, new RegExp(escapeRegExp(sessionSettingsPath(config, SESSION_A))));
+    assert.match(activated, /FAKE_ARG=--resume\n/);
+    assert.match(activated, new RegExp(SESSION_A));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("SessionStart warns when a pending route was launched without loading the shell integration", () => {
+  const root = mkdtempSync(join(tmpdir(), "cc-codex-session-warning-"));
+  try {
+    const config = testConfig(root, 34116);
+    ensureState(config);
+    const terminal = normalizeTerminalIdentity({ shellPid: 4545, tty: "ttys045" });
+    writeMode(config, {
+      sessionId: SESSION_A,
+      terminal,
+      model: gatewayAliasForModel("gpt-5.6-sol"),
+    });
+    const result = runSessionHook(config, {
+      input: {
+        session_id: SESSION_A,
+        hook_event_name: "SessionStart",
+        source: "resume",
+        cwd: root,
+      },
+      environment: {
+        CLAUDE_CODEX_SHELL_PID: String(terminal.shellPid),
+        CLAUDE_CODEX_TTY: terminal.tty,
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const response = JSON.parse(result.stdout.trim());
+    assert.match(response.systemMessage, /has not loaded the CC Codex launcher/);
+    assert.match(response.systemMessage, new RegExp(escapeRegExp(shellActivationCommand(config))));
+    assert.equal(existsSync(config.proxyPidPath), false);
+    assert.equal(existsSync(config.gatewayPidPath), false);
+    assert.equal(existsSync(config.appServerPidPath), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("SessionStart surfaces missing authentication inline without starting a partial stack", () => {
+  const root = mkdtempSync(join(tmpdir(), "cc-codex-session-auth-error-"));
+  try {
+    const config = testConfig(root, 34316);
+    const result = runSessionHook(config, {
+      input: {
+        session_id: SESSION_A,
+        hook_event_name: "SessionStart",
+        source: "resume",
+        cwd: root,
+      },
+      environment: { CLAUDE_CODEX_ACTIVE: "1" },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const response = JSON.parse(result.stdout.trim());
+    assert.match(response.systemMessage, /^CC Codex startup failed:/);
+    assert.match(response.systemMessage, /Run \/codex:auth, then retry/);
+    assert.equal(existsSync(config.proxyPidPath), false);
+    assert.equal(existsSync(config.gatewayPidPath), false);
+    assert.equal(existsSync(config.appServerPidPath), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("startup failures include a redacted log tail and its exact path", () => {
+  const root = mkdtempSync(join(tmpdir(), "cc-codex-startup-log-"));
+  try {
+    const logPath = join(root, "service.log");
+    writeFileSync(
+      logPath,
+      Array.from({ length: 20 }, (_, index) => `line-${index}`).join("\n") +
+        "\nBearer secret-token\nsk-example1234567890\n" +
+        "eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0.signature\nlast-visible-line\n",
+    );
+    const message = startupFailureMessage(new Error("service exited"), logPath);
+    assert.match(message, /service exited/);
+    assert.match(message, /Last startup output:/);
+    assert.match(message, /last-visible-line/);
+    assert.match(message, new RegExp(escapeRegExp(logPath)));
+    assert.doesNotMatch(message, /secret-token|sk-example1234567890|eyJhbGciOiJub25l/);
+    assert.match(message, /\[redacted\]/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("stale service cleanup detects live routed processes even when session markers are missing", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cc-codex-live-process-"));
+  const marker = join(root, "session-modes", `${SESSION_A}.settings.json`);
+  const child = spawn(
+    process.execPath,
+    ["-e", "setInterval(() => {}, 1000)", marker],
+    { stdio: "ignore" },
+  );
+  try {
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+    const matches = findLiveRoutedProcesses(root);
+    assert.ok(matches.some((record) => record.pid === child.pid));
+  } finally {
+    child.kill("SIGTERM");
+    await new Promise((resolvePromise) => {
+      child.once("exit", resolvePromise);
+      setTimeout(resolvePromise, 1_000);
+    });
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -468,6 +819,8 @@ function writeMode(config, {
   terminal,
   model,
   permissionMode = null,
+  fastMode = false,
+  fastModelIds: supportedFastModels = [],
 } = {}) {
   const settingsPath = sessionSettingsPath(config, sessionId);
   const record = {
@@ -479,13 +832,19 @@ function writeMode(config, {
     selectedModelId: decodeGatewayModelAlias(model),
     selectedModelDisplayName: decodeGatewayModelAlias(model),
     availableModels: [model, gatewayAliasForModel("gpt-5.4")],
+    fastModelIds: supportedFastModels,
+    fastMode,
     settingsPath,
     terminal,
     forceModelOnNextLaunch: true,
     enabledAt: "2026-07-13T00:00:00.000Z",
     updatedAt: "2026-07-13T00:00:00.000Z",
   };
-  writeFileSync(settingsPath, `${JSON.stringify(renderClaudeCodexSettings(config, model, record.availableModels), null, 2)}\n`, { mode: 0o600 });
+  writeFileSync(
+    settingsPath,
+    `${JSON.stringify(renderClaudeCodexSettings(config, model, record.availableModels, { sessionId }), null, 2)}\n`,
+    { mode: 0o600 },
+  );
   writeFileSync(sessionModePath(config, sessionId), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
   writeFileSync(terminalRoutePath(config, terminal), `${JSON.stringify({
     version: 1,
@@ -502,6 +861,41 @@ function writeMode(config, {
 function fakeJwt(payload) {
   const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
   return `${encode({ alg: "none", typ: "JWT" })}.${encode(payload)}.test-signature`;
+}
+
+function runSessionHook(config, { input, environment = {} }) {
+  const home = join(config.testRoot, "home");
+  mkdirSync(home, { recursive: true });
+  return spawnSync(
+    process.execPath,
+    [join(ROOT, "scripts", "session-lifecycle.mjs"), "start"],
+    {
+      input: JSON.stringify(input),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HOME: home,
+        CODEX_HOME: config.codexHome,
+        CLAUDE_PLUGIN_DATA: config.stateDir,
+        CLAUDE_CODEX_STATE_DIR: config.stateDir,
+        CLAUDE_CODEX_RUNTIME_DIR: config.runtimeDir,
+        CLAUDE_CODEX_GATEWAY_PORT: String(config.gatewayPort),
+        CLAUDE_CODEX_PROXY_PORT: String(config.proxyPort),
+        CLAUDE_CODEX_APP_SERVER_PORT: String(config.appServerPort),
+        CLAUDE_CODEX_ZSHRC_PATH: config.zshrcPath,
+        CLAUDE_CODEX_CLAUDE_SETTINGS_PATH: config.claudeUserSettingsPath,
+        ...environment,
+      },
+    },
+  );
+}
+
+function shellQuoteForTest(value) {
+  return `'${String(value).replaceAll("'", `'\\''`)}'`;
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function testConfig(root, gatewayPort) {

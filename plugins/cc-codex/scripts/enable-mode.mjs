@@ -52,24 +52,27 @@ try {
   const model = `${enabled.selected.displayName ?? enabled.selected.id} (${enabled.selected.id})`;
   if (enabled.shell.activeInCurrentShell) {
     respond(
-      `Codex is enabled only for this conversation in this terminal.\n\n` +
+      `CC Codex is enabled for this conversation.\n\n` +
         `Model: ${model}\n\n` +
-        "Press Ctrl+C twice to exit Claude, then run `claude` normally in this same terminal. " +
-        "It will resume this conversation through Codex automatically.\n\n" +
-        "Other terminals and Claude sessions are unchanged.",
+        "Do these exact steps:\n" +
+        "1. Press Ctrl+C twice to exit Claude.\n" +
+        "2. Run:\n\n" +
+        "```sh\nclaude\n```\n\n" +
+        "Other terminals remain on normal Claude.",
     );
   } else {
     respond(
-      `Codex is enabled only for this conversation in this terminal.\n\n` +
+      `CC Codex is ready for this conversation.\n\n` +
         `Model: ${model}\n\n` +
-        "One-time setup: the terminal integration was added to your zsh configuration. " +
-        "Press Ctrl+C twice to exit Claude, run `exec zsh` once in this same terminal, then run `claude` normally. " +
-        "It will resume this conversation through Codex automatically.\n\n" +
-        "After this one-time setup, the normal flow is simply: exit Claude, then run `claude`. " +
-        "Other terminals and Claude sessions are unchanged.",
+        "REQUIRED FIRST-TIME STEP\n\n" +
+        "1. Press Ctrl+C twice to exit Claude.\n" +
+        "2. Run this exact command in the same terminal:\n\n" +
+        `\`\`\`sh\n${enabled.shell.activationCommand}\n\`\`\`\n\n` +
+        "Do not run plain `claude` first; that would start normal Claude. " +
+        "The command above loads CC Codex and resumes this conversation.",
     );
   }
 } catch (error) {
-  const message = error instanceof UserError ? error.message : "Unexpected CC Codex setup failure";
+  const message = error instanceof Error ? error.message : String(error);
   respond(`CC Codex could not be enabled: ${message}`);
 }

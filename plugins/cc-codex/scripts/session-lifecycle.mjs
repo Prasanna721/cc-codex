@@ -14,23 +14,44 @@ import {
   installShellIntegration,
   listTerminalRoutes,
   markSessionStarted,
+  pendingRouteNotice,
+  deriveTerminalIdentity,
   restoreLegacyGlobalMode,
   updateSessionFromTranscript,
 } from "../lib/mode.mjs";
 
-let text = "";
-for await (const chunk of process.stdin) text += chunk;
-
-try {
+async function main() {
+  let text = "";
+  for await (const chunk of process.stdin) text += chunk;
   const input = JSON.parse(text);
   const config = getConfig();
   restoreLegacyGlobalMode(config);
-  if (process.env.CLAUDE_CODEX_ACTIVE !== "1") process.exit(0);
+  const shell = installShellIntegration(config);
+
+  if (process.env.CLAUDE_CODEX_ACTIVE !== "1") {
+    if (process.argv[2] !== "start") return;
+    let terminalIdentity = null;
+    try {
+      terminalIdentity = deriveTerminalIdentity({ claudePid: process.ppid });
+    } catch {
+      // A plain Claude launch with no pending route should stay silent.
+    }
+    const notice = pendingRouteNotice(config, {
+      terminalIdentity,
+      cwd: input.cwd,
+      shellIntegrationActive: shell.activeInCurrentShell,
+      bypassReason: process.env.CLAUDE_CODEX_BYPASS_REASON ?? null,
+    });
+    if (notice) emitSystemMessage(notice);
+    return;
+  }
+
   if (process.argv[2] === "start") {
-    installShellIntegration(config);
+    // Authentication/proxy failure must happen before the app-server is
+    // started so a failed launch cannot leave a partial service stack behind.
+    await ensureProxy(config);
     await Promise.all([
       ensureGateway(config),
-      ensureProxy(config),
       ensureAppServer(config),
     ]);
     const mode = markSessionStarted(config, {
@@ -57,7 +78,13 @@ try {
       await stopServices(config);
     }
   }
-} catch (error) {
-  process.stderr.write(`cc-codex session hook: ${error.message}\n`);
-  process.exitCode = 1;
 }
+
+function emitSystemMessage(message) {
+  process.stdout.write(`${JSON.stringify({ systemMessage: message })}\n`);
+}
+
+main().catch((error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  emitSystemMessage(`CC Codex startup failed:\n\n${message}`);
+});

@@ -24,6 +24,18 @@
             "statusMessage": "Disabling Codex for this session"
           }
         ]
+      },
+      {
+        "matcher": "codex:fast",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/fast-mode.mjs"],
+            "timeout": 120,
+            "statusMessage": "Updating Codex Fast mode"
+          }
+        ]
       }
     ],
     "SessionStart": [

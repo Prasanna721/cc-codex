@@ -1,0 +1,9 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "codex",
+  "version": "0.8.1",
+  "description": "Run Claude Code conversations on Codex subscription models.",
+  "author": {
+    "name": "Prasanna"
+  }
+}

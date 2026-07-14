@@ -1,0 +1,13 @@
+{
+  "name": "cc-codex",
+  "version": "0.8.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check plugins/cc-codex/lib/core.mjs && node --check plugins/cc-codex/lib/mode.mjs && node --check plugins/cc-codex/lib/gateway.mjs && node --check plugins/cc-codex/scripts/plugin-action.mjs && node --check plugins/cc-codex/scripts/enable-mode.mjs && node --check plugins/cc-codex/scripts/disable-mode.mjs && node --check plugins/cc-codex/scripts/session-lifecycle.mjs && node --check plugins/cc-codex/scripts/terminal-launcher.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

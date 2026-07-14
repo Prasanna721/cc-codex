@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "cc-codex",
+  "description": "Run Claude Code conversations on Codex subscription models.",
+  "owner": {
+    "name": "Prasanna"
+  },
+  "plugins": [
+    {
+      "name": "codex",
+      "source": "./plugins/cc-codex",
+      "description": "Run Claude Code conversations on Codex subscription models.",
+      "version": "0.8.1",
+      "author": {
+        "name": "Prasanna"
+      }
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "hooks": {
+    "UserPromptExpansion": [
+      {
+        "matcher": "codex:enable",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/enable-mode.mjs"],
+            "timeout": 120,
+            "statusMessage": "Enabling Codex for this terminal session"
+          }
+        ]
+      },
+      {
+        "matcher": "codex:disable",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/disable-mode.mjs"],
+            "timeout": 30,
+            "statusMessage": "Disabling Codex for this session"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/session-lifecycle.mjs", "start"],
+            "timeout": 120,
+            "statusMessage": "Starting shared Codex services"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/session-lifecycle.mjs", "end"]
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -13,12 +13,19 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { Socket } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 
+import {
+  FAST_REQUEST_HEADER,
+  SESSION_REQUEST_HEADER,
+} from "./fast.mjs";
+import { traceModeEnabled } from "./trace.mjs";
+
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-export const CONTROLLER_VERSION = "0.8.1";
+export const CONTROLLER_VERSION = "0.9.1";
 
 export const CLIPROXY_PIN = Object.freeze({
   version: "7.2.71",
@@ -98,7 +105,7 @@ export class UserError extends Error {
 export function getConfig(overrides = {}) {
   const pluginDataDir = process.env.CLAUDE_PLUGIN_DATA || null;
   const configuredStateDir =
-    overrides.stateDir ?? process.env.CLAUDE_CODEX_STATE_DIR ?? pluginDataDir;
+    overrides.stateDir ?? pluginDataDir ?? process.env.CLAUDE_CODEX_STATE_DIR;
   if (!configuredStateDir) {
     throw new UserError(
       "CC Codex must run as a Claude Code plugin so CLAUDE_PLUGIN_DATA is available.",
@@ -132,6 +139,14 @@ export function getConfig(overrides = {}) {
   const codexHome = resolve(
     overrides.codexHome ?? process.env.CODEX_HOME ?? join(homedir(), ".codex"),
   );
+  const logsDir = join(stateDir, "logs");
+  const traceEnabled = traceModeEnabled(
+    overrides.traceEnabled ?? process.env.CLAUDE_CODEX_TRACE,
+  );
+  const tracePath = resolve(
+    overrides.tracePath ?? process.env.CLAUDE_CODEX_TRACE_PATH ??
+      join(logsDir, "request-trace.jsonl"),
+  );
 
   return {
     root: ROOT,
@@ -148,7 +163,7 @@ export function getConfig(overrides = {}) {
     codexHome,
     localCodexAuthPath: resolve(overrides.localCodexAuthPath ?? join(codexHome, "auth.json")),
     localProxyAuthPath: join(stateDir, "cliproxy-auth", "codex-local.json"),
-    logsDir: join(stateDir, "logs"),
+    logsDir,
     locksDir: join(stateDir, "locks"),
     sessionsDir: join(stateDir, "sessions"),
     terminalRoutesDir: join(stateDir, "terminal-routes"),
@@ -174,6 +189,8 @@ export function getConfig(overrides = {}) {
     proxyKeyPath: join(stateDir, "proxy.key"),
     proxyConfigPath: join(stateDir, "cliproxyapi.yaml"),
     proxyAliasesPath: join(stateDir, "proxy-model-aliases.json"),
+    traceEnabled,
+    tracePath,
     pluginDir: ROOT,
   };
 }
@@ -326,12 +343,19 @@ export function buildClaudeCodexEnvironment(
   config,
   proxyModelId,
   baseEnvironment = process.env,
+  { sessionId = null } = {},
 ) {
   const { key } = ensureState(config);
   const environment = { ...baseEnvironment };
   for (const name of CLAUDE_PROVIDER_ENV_KEYS) delete environment[name];
 
-  const reservedHeaders = new Set(["authorization", "x-api-key", "x-claude-codex-model"]);
+  const reservedHeaders = new Set([
+    "authorization",
+    "x-api-key",
+    "x-claude-codex-model",
+    FAST_REQUEST_HEADER,
+    SESSION_REQUEST_HEADER,
+  ]);
   const existingHeaders = String(baseEnvironment.ANTHROPIC_CUSTOM_HEADERS ?? "")
     .split("\n")
     .filter((line) => {
@@ -340,10 +364,17 @@ export function buildClaudeCodexEnvironment(
       return line.trim() && !reservedHeaders.has(name);
     });
 
+  const routingHeaders = [`x-claude-codex-model: ${proxyModelId}`];
+  if (sessionId) {
+    validateSessionId(sessionId);
+    routingHeaders.push(`${SESSION_REQUEST_HEADER}: ${sessionId}`);
+  }
+
   Object.assign(environment, {
     ANTHROPIC_BASE_URL: config.gatewayBaseUrl,
     ANTHROPIC_AUTH_TOKEN: key,
-    ANTHROPIC_CUSTOM_HEADERS: [`x-claude-codex-model: ${proxyModelId}`, ...existingHeaders].join("\n"),
+    ANTHROPIC_CUSTOM_HEADERS: [...routingHeaders, ...existingHeaders].join("\n"),
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "1",
     CLAUDE_CODE_SUBAGENT_MODEL: "inherit",
     CLAUDE_CODEX_ACTIVE: "1",
@@ -354,21 +385,20 @@ export function buildClaudeCodexEnvironment(
     CLAUDE_CODEX_PROXY_PORT: String(config.proxyPort),
     CLAUDE_CODEX_APP_SERVER_PORT: String(config.appServerPort),
   });
-  // Claude classifies live gateway model discovery as nonessential traffic.
-  delete environment.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC;
   return environment;
 }
 
-export function renderClaudeCodexSettings(config, proxyModelId, availableModels = [proxyModelId]) {
+export function renderClaudeCodexSettings(
+  config,
+  proxyModelId,
+  availableModels = [proxyModelId],
+  { sessionId = null } = {},
+) {
   const environment = Object.fromEntries(
     CLAUDE_PROVIDER_ENV_KEYS.map((name) => [name, ""]),
   );
-  const active = buildClaudeCodexEnvironment(config, proxyModelId, {});
-  Object.assign(environment, active, {
-    // A settings file cannot delete an inherited variable, so override it with
-    // the empty value that Claude's environment parser treats as disabled.
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "",
-  });
+  const active = buildClaudeCodexEnvironment(config, proxyModelId, {}, { sessionId });
+  Object.assign(environment, active);
   return {
     $schema: "https://json.schemastore.org/claude-code-settings.json",
     model: proxyModelId,
@@ -404,7 +434,7 @@ export function renderProxyConfig(config, key, aliases = []) {
     "logging-to-file: false",
     "logs-max-total-size-mb: 32",
     "error-logs-max-files: 2",
-    "usage-statistics-enabled: false",
+    `usage-statistics-enabled: ${config.traceEnabled ? "true" : "false"}`,
     "commercial-mode: true",
     'proxy-url: ""',
     "request-retry: 2",
@@ -422,6 +452,17 @@ export function renderProxyConfig(config, key, aliases = []) {
       );
     }
   }
+  lines.push(
+    "payload:",
+    "  override:",
+    "    - models:",
+    '        - name: "gpt-*"',
+    '          protocol: "codex"',
+    "          headers:",
+    `            X-CC-Codex-Fast: "1"`,
+    "      params:",
+    `        service_tier: "priority"`,
+  );
   lines.push("");
   return lines.join("\n");
 }
@@ -523,9 +564,18 @@ async function sha256File(path) {
 }
 
 function runChecked(command, args, options = {}) {
-  const result = spawnSync(command, args, { stdio: "inherit", ...options });
+  const result = spawnSync(command, args, { encoding: "utf8", ...options });
   if (result.error) throw new UserError(`${command} failed: ${result.error.message}`);
-  if (result.status !== 0) throw new UserError(`${command} exited with status ${result.status}`);
+  if (result.status !== 0) {
+    const output = [result.stderr, result.stdout]
+      .map((value) => String(value ?? "").trim())
+      .filter(Boolean)
+      .join("\n");
+    throw new UserError(
+      `${command} exited with status ${result.status}` +
+        (output ? `\nCommand output:\n${redactDiagnostic(tailText(output))}` : ""),
+    );
+  }
   return result;
 }
 
@@ -553,6 +603,32 @@ function readJson(path) {
   } catch {
     return null;
   }
+}
+
+export function startupFailureMessage(error, logPath) {
+  const message = error instanceof Error ? error.message : String(error);
+  let output = "";
+  try {
+    output = readFileSync(logPath, "utf8");
+  } catch {
+    // A process can fail before opening its log file.
+  }
+  const tail = redactDiagnostic(tailText(output));
+  return message +
+    (tail ? `\nLast startup output:\n${tail}` : "\nNo startup output was produced.") +
+    `\nLog: ${logPath}`;
+}
+
+function tailText(value, maxLines = 16, maxChars = 4_000) {
+  const lines = String(value ?? "").trim().split(/\r?\n/).filter(Boolean);
+  return lines.slice(-maxLines).join("\n").slice(-maxChars);
+}
+
+function redactDiagnostic(value) {
+  return String(value ?? "")
+    .replace(/Bearer\s+[^\s"']+/gi, "Bearer [redacted]")
+    .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[redacted-api-key]")
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[redacted-jwt]");
 }
 
 function processCommand(pid) {
@@ -590,7 +666,13 @@ async function withLock(config, name, action, timeoutMs = 20_000) {
         continue;
       }
       if (Date.now() - started > timeoutMs) {
-        throw new UserError(`Timed out waiting for ${name} startup lock`);
+        const ownerDetail = owner?.pid
+          ? ` The lock is held by PID ${owner.pid}.`
+          : " The lock owner could not be identified.";
+        throw new UserError(
+          `Timed out waiting for the ${name} startup lock.${ownerDetail} ` +
+            `Lock: ${path}\nRetry /codex:enable.`,
+        );
       }
       await delay(100);
     }
@@ -618,7 +700,16 @@ export async function proxyReady(config = getConfig()) {
     const root = await fetchWithTimeout(`${config.proxyBaseUrl}/`);
     if (!root.ok) return false;
     const body = await root.json();
-    return body?.message === "CLI Proxy API Server";
+    if (body?.message !== "CLI Proxy API Server") return false;
+    const key = readFileSync(config.proxyKeyPath, "utf8").trim();
+    if (!/^[a-f0-9]{64}$/.test(key)) return false;
+    const models = await fetchWithTimeout(`${config.proxyBaseUrl}/v1/models`, {
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Anthropic-Version": "2023-06-01",
+      },
+    });
+    return models.ok;
   } catch {
     return false;
   }
@@ -638,10 +729,138 @@ export async function gatewayReady(config = getConfig()) {
     const response = await fetchWithTimeout(`${config.gatewayBaseUrl}/healthz`);
     if (!response.ok) return false;
     const body = await response.json();
-    return body?.service === "claude-codex-gateway";
+    if (body?.service !== "claude-codex-gateway") return false;
+    const key = readFileSync(config.proxyKeyPath, "utf8").trim();
+    if (!/^[a-f0-9]{64}$/.test(key)) return false;
+    const models = await fetchWithTimeout(`${config.gatewayBaseUrl}/v1/models`, {
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Anthropic-Version": "2023-06-01",
+      },
+    });
+    return models.ok;
   } catch {
     return false;
   }
+}
+
+async function portIsListening(port, timeoutMs = 500) {
+  return new Promise((resolvePromise) => {
+    const socket = new Socket();
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolvePromise(value);
+    };
+    socket.setTimeout(timeoutMs, () => finish(false));
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+    socket.connect(port, "127.0.0.1");
+  });
+}
+
+function listeningProcess(port) {
+  const result = spawnSync(
+    "lsof",
+    ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"],
+    { encoding: "utf8" },
+  );
+  const pid = Number(String(result.stdout ?? "").trim().split(/\s+/)[0]);
+  if (!Number.isInteger(pid) || pid <= 1) return null;
+  return { pid, command: processCommand(pid) };
+}
+
+async function reclaimIdleCcCodexServices(config) {
+  const owner = listeningProcess(config.proxyPort);
+  const match = owner?.command.match(/\s-config\s+(?:"([^"]+)"|'([^']+)'|(\S+))/);
+  const legacyConfigPath = match?.[1] ?? match?.[2] ?? match?.[3] ?? null;
+  if (!legacyConfigPath || !existsSync(legacyConfigPath)) return false;
+  let generated;
+  try {
+    generated = readFileSync(legacyConfigPath, "utf8").startsWith("# Generated by CC Codex.");
+  } catch {
+    generated = false;
+  }
+  if (!generated) return false;
+
+  const stateDir = dirname(legacyConfigPath);
+  const sessionsDir = join(stateDir, "sessions");
+  const liveSessions = [];
+  if (existsSync(sessionsDir)) {
+    for (const name of readdirSync(sessionsDir)) {
+      if (!name.endsWith(".json")) continue;
+      const record = readJson(join(sessionsDir, name));
+      const pid = record?.claudePid ?? record?.launcherPid;
+      if (record && isPidAlive(pid)) liveSessions.push(record);
+    }
+  }
+  const liveProcessPids = findLiveRoutedProcesses(stateDir).map((processRecord) => processRecord.pid);
+  const livePids = [...new Set([
+    ...liveSessions.map((session) => session.claudePid ?? session.launcherPid),
+    ...liveProcessPids,
+  ])];
+  if (livePids.length) {
+    throw new UserError(
+      `An older CC Codex routed process is still active (PID ${livePids.join(", ")}) and owns ` +
+        `port ${config.proxyPort}. ` +
+      "Close that Claude session, then run /codex:enable again.",
+    );
+  }
+
+  for (const [name, label] of [
+    ["claude-gateway.pid.json", "older CC Codex gateway"],
+    ["cliproxy.pid.json", "older CC Codex proxy"],
+    ["codex-app-server.pid.json", "older Codex app-server"],
+  ]) {
+    const path = join(stateDir, name);
+    const record = readJson(path);
+    if (isPidAlive(record?.pid)) await stopPid(record.pid, label).catch(() => {});
+    rmSync(path, { force: true });
+  }
+  return true;
+}
+
+export function findLiveRoutedProcesses(stateDir) {
+  const root = resolve(stateDir);
+  const markers = [
+    `${join(root, "session-modes")}/`,
+    join(root, "shell", "terminal-launcher.mjs"),
+  ];
+  const result = spawnSync("ps", ["-axo", "pid=,command="], { encoding: "utf8" });
+  if (result.status !== 0) return [];
+  const matches = [];
+  for (const line of String(result.stdout ?? "").split(/\r?\n/)) {
+    const parsed = line.match(/^\s*(\d+)\s+(.+)$/);
+    if (!parsed) continue;
+    const pid = Number(parsed[1]);
+    if (pid === process.pid || !isPidAlive(pid)) continue;
+    if (markers.some((marker) => parsed[2].includes(marker))) {
+      matches.push({ pid, command: parsed[2] });
+    }
+  }
+  return matches;
+}
+
+async function requireFreePort(config, label, port, { reclaim = false } = {}) {
+  if (!(await portIsListening(port))) return;
+  if (reclaim && await reclaimIdleCcCodexServices(config)) {
+    const started = Date.now();
+    while (await portIsListening(port)) {
+      if (Date.now() - started > 3_000) break;
+      await delay(100);
+    }
+    if (!(await portIsListening(port))) return;
+  }
+  const owner = listeningProcess(port);
+  const detail = owner
+    ? ` PID ${owner.pid}: ${owner.command.slice(0, 500)}`
+    : " an unknown process";
+  throw new UserError(
+    `${label} cannot start because 127.0.0.1:${port} is already in use by${detail}. ` +
+      "Stop that process, then run /codex:enable again.",
+  );
 }
 
 async function waitUntil(check, label, timeoutMs = 15_000) {
@@ -668,39 +887,56 @@ function spawnDetached(binary, args, logPath, options = {}) {
 }
 
 export async function ensureProxy(config = getConfig()) {
-  ensureState(config);
+  const { key } = ensureState(config);
   const localAuth = syncLocalCodexAuth(config);
   if (!localAuth.available) {
     throw new UserError(
       "Codex is not signed in on this machine. Run /codex:auth, then retry.",
     );
   }
-  if (await proxyReady(config)) {
-    return { pid: managedPid(config.proxyPidPath, (cmd) => cmd.includes("cli-proxy-api")), reused: true };
+  const signature = (cmd, record) =>
+    cmd.includes("cli-proxy-api") && traceModeMatches(config, record);
+  const reusablePid = managedPid(config.proxyPidPath, signature);
+  if (reusablePid && await proxyReady(config)) {
+    return { pid: reusablePid, reused: true };
   }
 
   return withLock(config, "proxy", async () => {
-    if (await proxyReady(config)) {
-      return { pid: managedPid(config.proxyPidPath, (cmd) => cmd.includes("cli-proxy-api")), reused: true };
+    const lockedReusablePid = managedPid(config.proxyPidPath, signature);
+    if (lockedReusablePid && await proxyReady(config)) {
+      return { pid: lockedReusablePid, reused: true };
     }
     const binary = await ensureProxyInstalled(config);
     const oldPid = managedPid(config.proxyPidPath, (cmd) => cmd.includes("cli-proxy-api"));
     if (oldPid) await stopPid(oldPid, "stale CLIProxyAPI");
+    await requireFreePort(config, "CLIProxyAPI", config.proxyPort, { reclaim: true });
 
+    const logPath = join(config.logsDir, "cliproxyapi.log");
     const pid = spawnDetached(
       binary,
       ["-config", config.proxyConfigPath],
-      join(config.logsDir, "cliproxyapi.log"),
+      logPath,
+      {
+        env: {
+          MANAGEMENT_PASSWORD: config.traceEnabled ? key : "",
+        },
+      },
     );
     writeAtomic(
       config.proxyPidPath,
-      `${JSON.stringify({ pid, binary, port: config.proxyPort, startedAt: new Date().toISOString() })}\n`,
+      `${JSON.stringify({
+        pid,
+        binary,
+        port: config.proxyPort,
+        traceEnabled: config.traceEnabled,
+        startedAt: new Date().toISOString(),
+      })}\n`,
     );
     try {
       await waitUntil(() => proxyReady(config), "CLIProxyAPI");
     } catch (error) {
       await stopPid(pid, "CLIProxyAPI", 2_000).catch(() => {});
-      throw new UserError(`${error.message}. See ${join(config.logsDir, "cliproxyapi.log")}`);
+      throw new UserError(startupFailureMessage(error, logPath));
     }
     return { pid, reused: false };
   });
@@ -734,10 +970,12 @@ export async function ensureAppServer(config = getConfig()) {
       (cmd) => cmd.includes("app-server") && cmd.includes(String(config.appServerPort)),
     );
     if (oldPid) await stopPid(oldPid, "stale Codex app-server");
+    await requireFreePort(config, "Codex app-server", config.appServerPort);
+    const logPath = join(config.logsDir, "codex-app-server.log");
     const pid = spawnDetached(
       codex,
       ["app-server", "--listen", config.appServerWsUrl],
-      join(config.logsDir, "codex-app-server.log"),
+      logPath,
     );
     writeAtomic(
       config.appServerPidPath,
@@ -747,7 +985,7 @@ export async function ensureAppServer(config = getConfig()) {
       await waitUntil(() => appServerReady(config), "Codex app-server");
     } catch (error) {
       await stopPid(pid, "Codex app-server", 2_000).catch(() => {});
-      throw new UserError(`${error.message}. See ${join(config.logsDir, "codex-app-server.log")}`);
+      throw new UserError(startupFailureMessage(error, logPath));
     }
     return { pid, reused: false };
   });
@@ -756,42 +994,65 @@ export async function ensureAppServer(config = getConfig()) {
 export async function ensureGateway(config = getConfig()) {
   ensureState(config);
   await ensureProxy(config);
-  const signature = (cmd) => cmd.includes("gateway.mjs") && cmd.includes(String(config.gatewayPort));
-  if (await gatewayReady(config)) {
-    return { pid: managedPid(config.gatewayPidPath, signature), reused: true };
+  const signature = (cmd, record) =>
+    cmd.includes("gateway.mjs") &&
+    cmd.includes(String(config.gatewayPort)) &&
+    traceModeMatches(config, record);
+  const reusablePid = managedPid(config.gatewayPidPath, signature);
+  if (reusablePid && await gatewayReady(config)) {
+    return { pid: reusablePid, reused: true };
   }
 
   return withLock(config, "gateway", async () => {
-    if (await gatewayReady(config)) {
-      return { pid: managedPid(config.gatewayPidPath, signature), reused: true };
+    const lockedReusablePid = managedPid(config.gatewayPidPath, signature);
+    if (lockedReusablePid && await gatewayReady(config)) {
+      return { pid: lockedReusablePid, reused: true };
     }
-    const oldPid = managedPid(config.gatewayPidPath, signature);
+    const oldPid = managedPid(
+      config.gatewayPidPath,
+      (cmd) => cmd.includes("gateway.mjs") && cmd.includes(String(config.gatewayPort)),
+    );
     if (oldPid) await stopPid(oldPid, "stale Claude gateway");
+    await requireFreePort(config, "Claude gateway", config.gatewayPort);
     const script = join(ROOT, "lib", "gateway.mjs");
+    const logPath = join(config.logsDir, "claude-gateway.log");
     const pid = spawnDetached(
       process.execPath,
       [script, "--port", String(config.gatewayPort)],
-      join(config.logsDir, "claude-gateway.log"),
+      logPath,
       {
         env: {
           CLAUDE_CODEX_GATEWAY_PORT: String(config.gatewayPort),
           CLAUDE_CODEX_PROXY_BASE_URL: config.proxyBaseUrl,
           CLAUDE_CODEX_PROXY_KEY_PATH: config.proxyKeyPath,
+          CLAUDE_CODEX_STATE_DIR: config.stateDir,
+          CLAUDE_CODEX_TRACE: config.traceEnabled ? "1" : "0",
+          CLAUDE_CODEX_TRACE_PATH: config.tracePath,
         },
       },
     );
     writeAtomic(
       config.gatewayPidPath,
-      `${JSON.stringify({ pid, binary: process.execPath, port: config.gatewayPort, startedAt: new Date().toISOString() })}\n`,
+      `${JSON.stringify({
+        pid,
+        binary: process.execPath,
+        port: config.gatewayPort,
+        traceEnabled: config.traceEnabled,
+        startedAt: new Date().toISOString(),
+      })}\n`,
     );
     try {
       await waitUntil(() => gatewayReady(config), "Claude gateway");
     } catch (error) {
       await stopPid(pid, "Claude gateway", 2_000).catch(() => {});
-      throw new UserError(`${error.message}. See ${join(config.logsDir, "claude-gateway.log")}`);
+      throw new UserError(startupFailureMessage(error, logPath));
     }
     return { pid, reused: false };
   });
+}
+
+function traceModeMatches(config, record) {
+  return Boolean(record?.traceEnabled) === Boolean(config.traceEnabled);
 }
 
 async function stopPid(pid, label, timeoutMs = 5_000) {

@@ -35,9 +35,15 @@ CC Codex uses the login already held by the local Codex CLI. If Codex is not sig
 
 That command runs `codex login`. It is only needed when the local credential is missing.
 
-After enable, exit Claude and run `claude` again in the same terminal. The conversation resumes on Codex. Other terminals keep using normal Claude.
+After enable, exit Claude with Ctrl+C twice. On the first enable, the current shell has not loaded the launcher yet, so `/codex:enable` prints one exact relaunch command like this:
 
-The first enable adds a small block to `~/.zshrc`. Run `exec zsh` once after that first enable, then start `claude` again.
+```sh
+source '/.../shell/cc-codex.zsh' && claude
+```
+
+Copy that command exactly. Do not run plain `claude` first. The conversation resumes on Codex, while other terminals keep using normal Claude. Later relaunches in this terminal only need `claude` because the launcher is loaded from `~/.zshrc`.
+
+If a pending Codex route is bypassed, the next Claude session shows the reason and the exact recovery command. Service startup failures also appear in Claude with the relevant log tail.
 
 To choose a Codex model, use Claude's normal picker:
 
@@ -51,6 +57,7 @@ There is no separate models command.
 
 - `/codex:enable [MODEL]` — route this conversation through Codex on its next launch.
 - `/codex:disable` — return this conversation to normal Claude after exit.
+- `/codex:fast [on|off|status]` — toggle Fast mode for this conversation. With no argument, it toggles.
 - `/codex:auth` — run local Codex login only when needed.
 - `/codex:usage` — show Codex limits with the same remaining-usage bars as Codex `/status`.
 - `/codex:status` — show the route, local login, and service state.
@@ -62,6 +69,10 @@ Enable creates a private route for the current shell, TTY, working directory, an
 Writable files live under `${CLAUDE_PLUGIN_DATA}`. The plugin reads the local Codex credential and writes a proxy-compatible copy into its private data directory; it never edits the original Codex auth file.
 
 CLIProxyAPI is an internal protocol adapter, not an authentication command. It is downloaded on demand, pinned to `v7.2.71`, and verified by SHA-256 before use.
+
+Fast mode is enabled only when the selected model advertises the Codex priority service tier. It takes effect on the next request and consumes credits faster than Standard mode.
+
+Routed sessions suppress Claude's nonessential background model traffic. This keeps one user prompt from silently becoming an extra Codex request while leaving the configured model picker available.
 
 See [plugins/cc-codex/docs/ARCHITECTURE.md](plugins/cc-codex/docs/ARCHITECTURE.md) for the routing design.
 
@@ -83,3 +94,11 @@ npm test
 claude plugin validate --strict ./plugins/cc-codex
 claude plugin validate --strict .
 ```
+
+Run the isolated latency harness with deterministic mock upstreams:
+
+```bash
+npm run benchmark:trace
+```
+
+Add `-- --real --real-runs 1` to compare the bridge, Claude Code, and native Codex with the local Codex subscription. Real mode makes bounded live model requests. The harness uses temporary state and ports; it does not install the plugin or edit normal Claude settings.

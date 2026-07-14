@@ -11,7 +11,7 @@ import {
   serviceStatus,
   syncLocalCodexAuth,
 } from "../lib/core.mjs";
-import { terminalModeStatus } from "../lib/mode.mjs";
+import { sessionFastStatus, terminalModeStatus } from "../lib/mode.mjs";
 
 const config = getConfig();
 
@@ -91,10 +91,17 @@ async function showStatus() {
   const authentication = localAuth.available
     ? "local Codex login"
     : "required (run /codex:auth)";
+  const fast = mode.enabled ? sessionFastStatus(mode.mode) : null;
+  const fastMode = !fast
+    ? "unavailable (enable Codex first)"
+    : fast.supported
+      ? fast.enabled ? "on" : "off"
+      : "unavailable for the selected model";
 
   process.stdout.write(
     "CC Codex\n" +
       `This conversation: ${mode.enabled ? `Codex (${mode.mode.selectedModelDisplayName ?? mode.mode.selectedModelId})` : "normal Claude"}\n` +
+      `Fast mode: ${fastMode}\n` +
       `Enabled terminal routes: ${mode.routeCount}\n` +
       `Authentication: ${authentication}\n` +
       `Claude gateway: ${status.gateway.running ? `running (PID ${status.gateway.pid})` : "stopped"}\n` +
@@ -117,7 +124,7 @@ function requireLocalCodexAuthentication() {
 }
 
 main(process.argv[2]).catch((error) => {
-  const message = error instanceof UserError ? error.message : "Unexpected CC Codex failure";
+  const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`Error: ${message}\n`);
   process.exitCode = 1;
 });

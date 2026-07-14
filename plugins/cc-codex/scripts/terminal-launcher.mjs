@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -75,7 +75,7 @@ export function buildLaunchPlan(args, environment = process.env, cwd = process.c
     rmSync(routePath, { force: true });
     return passthrough("invalid route state");
   }
-  if (resolve(cwd) !== resolve(route.cwd) || resolve(cwd) !== resolve(mode.cwd)) {
+  if (!samePath(cwd, route.cwd) || !samePath(cwd, mode.cwd)) {
     return passthrough("working directory changed");
   }
   if (!existsSync(mode.settingsPath)) {
@@ -171,7 +171,7 @@ function validMode(mode, route, stateDir) {
     typeof mode.proxyModelId !== "string" || !mode.proxyModelId.startsWith("claude-codex-")
   ) return false;
   const expectedSettings = resolve(stateDir, "session-modes", `${mode.sessionId}.settings.json`);
-  return resolve(mode.settingsPath) === expectedSettings;
+  return samePath(mode.settingsPath, expectedSettings);
 }
 
 function validSessionId(sessionId) {
@@ -186,6 +186,14 @@ function readJson(path) {
   }
 }
 
+function samePath(left, right) {
+  try {
+    return realpathSync(resolve(left)) === realpathSync(resolve(right));
+  } catch {
+    return resolve(left) === resolve(right);
+  }
+}
+
 async function run() {
   const realClaude = process.env.CLAUDE_CODEX_REAL_CLAUDE;
   if (!realClaude) {
@@ -196,13 +204,14 @@ async function run() {
   const originalArgs = process.argv.slice(2);
   const plan = buildFailOpenLaunchPlan(originalArgs);
   // Route state is optional. A corrupt/unreadable route must never prevent
-  // the ordinary Claude command from starting.
-  if (plan.routeError && process.env.CLAUDE_CODEX_DEBUG === "1") {
-    process.stderr.write(`cc-codex: ignoring route error: ${plan.routeError}\n`);
+  // ordinary Claude from starting, but it must not fail silently either.
+  if (plan.routeError) {
+    process.stderr.write(`cc-codex: route check failed: ${plan.routeError}\n`);
   }
   const environment = { ...process.env };
   delete environment.CLAUDE_CODEX_BYPASS;
   if (plan.routed) {
+    delete environment.CLAUDE_CODEX_BYPASS_REASON;
     Object.assign(environment, {
       CLAUDE_CODEX_ACTIVE: "1",
       CLAUDE_CODEX_ROUTED: "1",
@@ -211,6 +220,7 @@ async function run() {
       CLAUDE_CODEX_STATE_DIR: plan.stateDir,
     });
   } else {
+    environment.CLAUDE_CODEX_BYPASS_REASON = plan.reason;
     delete environment.CLAUDE_CODEX_ACTIVE;
     delete environment.CLAUDE_CODEX_ROUTED;
     delete environment.CLAUDE_CODEX_SESSION_ID;
@@ -239,9 +249,18 @@ async function run() {
   process.exitCode = result.code ?? 1;
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isMainModule(process.argv[1])) {
   run().catch((error) => {
     process.stderr.write(`cc-codex: ${error.message}\n`);
     process.exitCode = 1;
   });
+}
+
+function isMainModule(argument) {
+  if (!argument) return false;
+  try {
+    return realpathSync(resolve(argument)) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return resolve(argument) === resolve(fileURLToPath(import.meta.url));
+  }
 }

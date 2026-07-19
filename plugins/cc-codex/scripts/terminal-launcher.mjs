@@ -91,8 +91,13 @@ export function buildLaunchPlan(args, environment = process.env, cwd = process.c
     return passthrough("explicit Claude launch mode");
   }
 
-  const injected = ["--settings", mode.settingsPath];
-  if (mode.forceModelOnNextLaunch === true) injected.push("--model", mode.proxyModelId);
+  // Claude restores the last assistant model from the transcript on resume.
+  // Always make the routed Codex selection explicit so an older Claude model
+  // cannot trigger its fallback warning and expose the private gateway alias.
+  const injected = [
+    "--settings", mode.settingsPath,
+    "--model", mode.proxyModelId,
+  ];
   if (!hasPermissionArgument(args)) {
     if (mode.permissionMode === "bypassPermissions") {
       injected.push("--dangerously-skip-permissions");

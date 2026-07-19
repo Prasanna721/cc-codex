@@ -282,7 +282,6 @@ async function prepareTerminalSessionModeCoordinated(config, {
     fastMode: previous?.fastMode === true && selectedSupportsFast,
     settingsPath,
     terminal,
-    forceModelOnNextLaunch: true,
     enabledAt: previous?.enabledAt ?? now,
     updatedAt: now,
   };
@@ -330,7 +329,9 @@ export function markSessionStarted(config, { sessionId, model = null } = {}) {
   const record = readSessionMode(config, sessionId);
   if (!record) return null;
   const updated = updateRecordModel(record, model);
-  updated.forceModelOnNextLaunch = false;
+  // Remove the pre-0.9.3 one-shot marker when an older mode record is reused.
+  // The launcher now passes the persisted selection on every routed resume.
+  delete updated.forceModelOnNextLaunch;
   updated.updatedAt = new Date().toISOString();
   writeSettingsForMode(config, updated);
   writeJson(sessionModePath(config, updated.sessionId), updated);

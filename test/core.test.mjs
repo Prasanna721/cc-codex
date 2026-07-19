@@ -60,6 +60,7 @@ import {
   setSessionFastMode,
   shellActivationCommand,
   terminalRoutePath,
+  updateSessionFromTranscript,
 } from "../plugins/cc-codex/lib/mode.mjs";
 import {
   buildFailOpenLaunchPlan,
@@ -633,7 +634,7 @@ test("pending routes produce an exact recovery command instead of silently using
   }
 });
 
-test("session start consumes the one-time model override and persists native model changes", () => {
+test("routed resumes explicitly select the persisted native model", () => {
   const root = mkdtempSync(join(tmpdir(), "claude-codex-model-state-"));
   try {
     const config = testConfig(root, 31416);
@@ -644,7 +645,7 @@ test("session start consumes the one-time model override and persists native mod
     writeMode(config, { sessionId: SESSION_A, terminal, model: first });
 
     const updated = markSessionStarted(config, { sessionId: SESSION_A, model: second });
-    assert.equal(updated.forceModelOnNextLaunch, false);
+    assert.equal("forceModelOnNextLaunch" in updated, false);
     assert.equal(updated.proxyModelId, second);
     assert.equal(updated.selectedModelId, "gpt-5.4");
     const settings = JSON.parse(readFileSync(sessionSettingsPath(config, SESSION_A), "utf8"));
@@ -656,7 +657,31 @@ test("session start consumes the one-time model override and persists native mod
       CLAUDE_CODEX_TTY: "ttys052",
     }, root);
     assert.equal(plan.routed, true);
-    assert.equal(plan.args.includes("--model"), false);
+    assert.deepEqual(plan.args.slice(0, 4), [
+      "--settings", sessionSettingsPath(config, SESSION_A),
+      "--model", second,
+    ]);
+
+    const third = gatewayAliasForModel("gpt-5.4-mini");
+    const transcriptPath = join(root, "session.jsonl");
+    writeFileSync(
+      transcriptPath,
+      `${JSON.stringify({ type: "assistant", message: { model: third } })}\n`,
+    );
+    const persisted = updateSessionFromTranscript(config, {
+      sessionId: SESSION_A,
+      transcriptPath,
+    });
+    assert.equal(persisted.proxyModelId, third);
+    const resumed = buildLaunchPlan([], {
+      CLAUDE_CODEX_STATE_DIR: config.stateDir,
+      CLAUDE_CODEX_SHELL_PID: "5252",
+      CLAUDE_CODEX_TTY: "ttys052",
+    }, root);
+    assert.deepEqual(resumed.args.slice(0, 4), [
+      "--settings", sessionSettingsPath(config, SESSION_A),
+      "--model", third,
+    ]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -975,7 +1000,8 @@ function writeMode(config, {
     fastMode,
     settingsPath,
     terminal,
-    forceModelOnNextLaunch: true,
+    // Exercise compatibility with mode records written before 0.9.3.
+    forceModelOnNextLaunch: false,
     enabledAt: "2026-07-13T00:00:00.000Z",
     updatedAt: "2026-07-13T00:00:00.000Z",
   };

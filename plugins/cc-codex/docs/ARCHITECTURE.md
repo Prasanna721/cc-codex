@@ -61,6 +61,8 @@ The first enable cannot modify the already-running parent shell. It therefore pr
 
 Any mismatch starts the real Claude executable and carries a reason into `SessionStart`, which warns when a pending route was expected. Explicit settings, model, session, print, background, worktree, safe-mode, and plugin-administration launches are intentional bypasses and remain quiet.
 
+Every routed resume passes the persisted Codex model as an explicit `--model` override. This prevents Claude's transcript restoration from selecting an older Claude model or printing the private gateway alias in a fallback warning. Model changes made through `/model` are persisted by the lifecycle hooks and become the next resume override.
+
 ## Fast mode
 
 `/codex:fast` stores a boolean in the current session-mode record. Each request carries a private session header to the gateway. The gateway removes that header, checks the live session record and model capability, and sends an internal Fast marker only for supported models. CLIProxyAPI converts that marker into `service_tier: priority` in the upstream Codex request. Toggling does not restart services or edit the user's Codex configuration.

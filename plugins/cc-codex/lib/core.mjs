@@ -26,7 +26,7 @@ import {
 import { traceModeEnabled } from "./trace.mjs";
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-export const CONTROLLER_VERSION = "0.9.2";
+export const CONTROLLER_VERSION = "0.9.3";
 
 export const CLIPROXY_PIN = Object.freeze({
   version: "7.2.71",

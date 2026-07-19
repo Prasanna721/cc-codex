@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.3
+
+- Passes the selected Codex model explicitly on every routed resume so Claude does not restore an older Claude model or expose the private gateway alias in its fallback warning.
+
 ## 0.9.2
 
 - Coordinates service startup across plugin data directories with one per-user lock.
